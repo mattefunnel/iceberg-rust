@@ -18,6 +18,7 @@
 [workspace]
 exclude = ["bindings/python"]
 members = [
+  "crates/actions",
   "crates/catalog/*",
   "crates/examples",
   "crates/iceberg",
