@@ -111,10 +111,7 @@ impl TestContext {
 
         let data_files: Vec<_> = (0..n)
             .map(|i| {
-                let file_path = format!(
-                    "data/{}-{i}.parquet",
-                    uuid::Uuid::now_v7()
-                );
+                let file_path = format!("data/{}-{i}.parquet", uuid::Uuid::now_v7());
                 DataFileBuilder::default()
                     .content(DataContentType::Data)
                     .file_path(file_path)

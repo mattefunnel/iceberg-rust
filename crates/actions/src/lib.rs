@@ -23,3 +23,5 @@ pub mod expire_snapshots;
 pub mod remove_orphan_files;
 pub mod rewrite_data_files;
 pub mod rewrite_manifests;
+
+pub use expire_snapshots::{ExpireSnapshots, ExpireSnapshotsResult};

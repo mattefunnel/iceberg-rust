@@ -3273,6 +3273,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-actions"
+version = "0.9.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "iceberg",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "iceberg-cache-moka"
 version = "0.9.0"
 dependencies = [
