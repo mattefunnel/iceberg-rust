@@ -3410,6 +3410,7 @@ dependencies = [
  "expect-test",
  "futures",
  "iceberg",
+ "iceberg-actions",
  "parquet",
  "tempfile",
  "tokio",
