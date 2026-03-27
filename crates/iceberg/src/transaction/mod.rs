@@ -54,6 +54,7 @@ mod action;
 
 pub use action::*;
 mod append;
+mod rewrite_files;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -65,6 +66,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
+pub use rewrite_files::RewriteFilesAction;
 
 use crate::error::Result;
 use crate::spec::TableProperties;
@@ -154,6 +156,11 @@ impl Transaction {
     /// Update the statistics of table
     pub fn update_statistics(&self) -> UpdateStatisticsAction {
         UpdateStatisticsAction::new()
+    }
+
+    /// Creates a rewrite files action for atomically replacing data files.
+    pub fn rewrite_files(&self) -> RewriteFilesAction {
+        RewriteFilesAction::new()
     }
 
     /// Commit transaction.

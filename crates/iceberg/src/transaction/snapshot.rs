@@ -67,7 +67,6 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     fn operation(&self) -> Operation;
 
     /// Returns manifest entries that should be marked as deleted in the new snapshot.
-    #[allow(unused)]
     fn delete_entries(
         &self,
         snapshot_produce: &SnapshotProducer,
@@ -319,6 +318,18 @@ impl<'a> SnapshotProducer<'a> {
         writer.write_manifest_file().await
     }
 
+    // Write manifest file for deleted data files and return the ManifestFile for ManifestList.
+    async fn write_delete_manifest(
+        &mut self,
+        delete_entries: Vec<ManifestEntry>,
+    ) -> Result<ManifestFile> {
+        let mut writer = self.new_manifest_writer(ManifestContentType::Data)?;
+        for entry in delete_entries {
+            writer.add_delete_entry(entry)?;
+        }
+        writer.write_manifest_file().await
+    }
+
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
         &mut self,
         snapshot_produce_operation: &OP,
@@ -345,8 +356,12 @@ impl<'a> SnapshotProducer<'a> {
             manifest_files.push(added_manifest);
         }
 
-        // # TODO
-        // Support process delete entries.
+        // Process delete entries.
+        let delete_entries = snapshot_produce_operation.delete_entries(self).await?;
+        if !delete_entries.is_empty() {
+            let delete_manifest = self.write_delete_manifest(delete_entries).await?;
+            manifest_files.push(delete_manifest);
+        }
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
         Ok(manifest_files)
