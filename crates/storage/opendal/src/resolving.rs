@@ -303,6 +303,10 @@ impl Storage for OpenDalResolvingStorage {
         Ok(())
     }
 
+    async fn list(&self, prefix: &str) -> Result<BoxStream<'static, Result<String>>> {
+        self.resolve(prefix)?.list(prefix).await
+    }
+
     fn new_input(&self, path: &str) -> Result<InputFile> {
         Ok(InputFile::new(
             Arc::new(self.resolve(path)?.as_ref().clone()),

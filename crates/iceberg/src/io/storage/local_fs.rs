@@ -209,6 +209,65 @@ impl Storage for LocalFsStorage {
         Ok(())
     }
 
+    async fn list(&self, prefix: &str) -> Result<BoxStream<'static, Result<String>>> {
+        let normalized = Self::normalize_path(prefix);
+
+        // Compute the scheme prefix that was stripped during normalization
+        // so we can reconstruct absolute paths in the output.
+        let normalized_str = normalized.to_string_lossy().to_string();
+        let scheme_prefix = if prefix.ends_with(&normalized_str) {
+            prefix[..prefix.len() - normalized_str.len()].to_string()
+        } else {
+            String::new()
+        };
+
+        // Find the directory to start walking from.
+        // If the normalized path is a directory, walk it directly.
+        // Otherwise, treat it as a path prefix and walk its parent.
+        let (walk_dir, filter_prefix) = if normalized.is_dir() {
+            (normalized.clone(), normalized_str)
+        } else {
+            let parent = normalized
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or(PathBuf::from("/"));
+            (parent, normalized_str)
+        };
+
+        // Recursively walk the directory tree
+        let mut results: Vec<Result<String>> = Vec::new();
+        if walk_dir.exists() {
+            let mut stack = vec![walk_dir];
+            while let Some(dir) = stack.pop() {
+                let entries = fs::read_dir(&dir).map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("Failed to read directory {}: {}", dir.display(), e),
+                    )
+                })?;
+                for entry in entries {
+                    let entry = entry.map_err(|e| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            format!("Failed to read directory entry: {e}"),
+                        )
+                    })?;
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        let path_str = path.to_string_lossy().to_string();
+                        if path_str.starts_with(&filter_prefix) {
+                            results.push(Ok(format!("{}{}", scheme_prefix, path_str)));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(futures::stream::iter(results).boxed())
+    }
+
     fn new_input(&self, path: &str) -> Result<InputFile> {
         Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
     }

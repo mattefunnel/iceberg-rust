@@ -536,6 +536,39 @@ impl Storage for OpenDalStorage {
         Ok(())
     }
 
+    async fn list(&self, prefix: &str) -> Result<BoxStream<'static, Result<String>>> {
+        let (op, relative_path) = self.create_operator(&prefix)?;
+        // Compute the scheme prefix so we can reconstruct absolute paths.
+        let scheme_prefix = prefix[..prefix.len() - relative_path.len()].to_string();
+        let relative_path = relative_path.to_string();
+
+        let lister = op
+            .lister_with(&relative_path)
+            .recursive(true)
+            .await
+            .map_err(from_opendal_error)?;
+
+        let stream = lister.filter_map(move |entry_result| {
+            let scheme_prefix = scheme_prefix.clone();
+            async move {
+                match entry_result {
+                    Ok(entry) => {
+                        let meta = entry.metadata();
+                        // Skip directories, only return files
+                        if meta.is_dir() {
+                            None
+                        } else {
+                            Some(Ok(format!("{}{}", scheme_prefix, entry.path())))
+                        }
+                    }
+                    Err(e) => Some(Err(from_opendal_error(e))),
+                }
+            }
+        });
+
+        Ok(stream.boxed())
+    }
+
     #[allow(unreachable_code, unused_variables)]
     fn new_input(&self, path: &str) -> Result<InputFile> {
         Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))

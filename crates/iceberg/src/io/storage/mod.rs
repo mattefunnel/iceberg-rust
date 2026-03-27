@@ -97,6 +97,11 @@ pub trait Storage: Debug + Send + Sync {
     /// Delete multiple files from a stream of paths.
     async fn delete_stream(&self, paths: BoxStream<'static, String>) -> Result<()>;
 
+    /// List all files under the given prefix.
+    ///
+    /// Returns a stream of absolute file paths that start with the given prefix.
+    async fn list(&self, prefix: &str) -> Result<BoxStream<'static, Result<String>>>;
+
     /// Create a new input file for reading
     fn new_input(&self, path: &str) -> Result<InputFile>;
 

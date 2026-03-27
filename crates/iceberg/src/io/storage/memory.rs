@@ -229,6 +229,32 @@ impl Storage for MemoryStorage {
         Ok(())
     }
 
+    async fn list(&self, prefix: &str) -> Result<BoxStream<'static, Result<String>>> {
+        let normalized = Self::normalize_path(prefix);
+        // Compute the scheme prefix that was stripped during normalization
+        // so we can reconstruct absolute paths in the output.
+        let scheme_prefix = if prefix.ends_with(&normalized) {
+            prefix[..prefix.len() - normalized.len()].to_string()
+        } else {
+            String::new()
+        };
+
+        let data = self.data.read().map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to acquire read lock: {e}"),
+            )
+        })?;
+
+        let paths: Vec<Result<String>> = data
+            .keys()
+            .filter(|k| k.starts_with(&normalized))
+            .map(|k| Ok(format!("{}{}", scheme_prefix, k)))
+            .collect();
+
+        Ok(futures::stream::iter(paths).boxed())
+    }
+
     fn new_input(&self, path: &str) -> Result<InputFile> {
         Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
     }

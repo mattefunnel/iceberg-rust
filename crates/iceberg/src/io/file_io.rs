@@ -19,6 +19,7 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 
 use super::storage::{
@@ -178,6 +179,20 @@ impl FileIO {
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub fn new_output(&self, path: impl AsRef<str>) -> Result<OutputFile> {
         self.get_storage()?.new_output(path.as_ref())
+    }
+
+    /// List all files under the given prefix.
+    ///
+    /// Returns a stream of absolute file paths that start with the given prefix.
+    ///
+    /// # Arguments
+    ///
+    /// * prefix: It should be an *absolute* path starting with the scheme string used to construct [`FileIO`].
+    pub async fn list(
+        &self,
+        prefix: impl AsRef<str>,
+    ) -> Result<BoxStream<'static, Result<String>>> {
+        self.get_storage()?.list(prefix.as_ref()).await
     }
 }
 
@@ -536,5 +551,41 @@ mod tests {
 
         assert_eq!(file_io.config().get("key1"), Some(&"value1".to_string()));
         assert_eq!(file_io.config().get("key2"), Some(&"value2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_file_io_list() {
+        use futures::TryStreamExt;
+
+        let file_io = FileIO::new_with_memory();
+        file_io
+            .new_output("memory:///a/b/file1.parquet")
+            .unwrap()
+            .write(Bytes::from("x"))
+            .await
+            .unwrap();
+        file_io
+            .new_output("memory:///a/b/file2.parquet")
+            .unwrap()
+            .write(Bytes::from("x"))
+            .await
+            .unwrap();
+        file_io
+            .new_output("memory:///a/c/file3.parquet")
+            .unwrap()
+            .write(Bytes::from("x"))
+            .await
+            .unwrap();
+
+        let mut listed: Vec<String> = file_io
+            .list("memory:///a/b/")
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        listed.sort();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|p| p.starts_with("memory:///a/b/")));
     }
 }
