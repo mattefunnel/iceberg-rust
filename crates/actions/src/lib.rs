@@ -25,3 +25,4 @@ pub mod rewrite_data_files;
 pub mod rewrite_manifests;
 
 pub use expire_snapshots::{ExpireSnapshots, ExpireSnapshotsResult};
+pub use rewrite_manifests::{RewriteManifests, RewriteManifestsResult};
