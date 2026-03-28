@@ -32,3 +32,4 @@ uuid = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 bytes = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
