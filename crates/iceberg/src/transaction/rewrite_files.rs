@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{DataFile, ManifestContentType, ManifestEntry, ManifestFile, Operation, Struct};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
@@ -41,9 +41,7 @@ use crate::{Error, ErrorKind};
 pub struct RewriteFilesAction {
     files_to_delete: Vec<DataFile>,
     files_to_add: Vec<DataFile>,
-    #[allow(dead_code)]
     starting_snapshot_id: Option<i64>,
-    #[allow(dead_code)]
     data_sequence_number: Option<i64>,
     commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
@@ -112,6 +110,7 @@ impl TransactionAction for RewriteFilesAction {
 
         let operation = RewriteFilesOperation {
             files_to_delete: self.files_to_delete.clone(),
+            data_sequence_number: self.data_sequence_number,
         };
 
         snapshot_producer
@@ -122,6 +121,10 @@ impl TransactionAction for RewriteFilesAction {
 
 struct RewriteFilesOperation {
     files_to_delete: Vec<DataFile>,
+    /// If set, validate that no new delete files have been added since this
+    /// sequence number for partitions containing files being rewritten.
+    /// Mirrors Java's `validateNoNewDeletesForDataFiles()`.
+    data_sequence_number: Option<i64>,
 }
 
 impl SnapshotProduceOperation for RewriteFilesOperation {
@@ -200,6 +203,46 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                     missing.join(", ")
                 ),
             ));
+        }
+
+        // Concurrent-delete validation: if data_sequence_number is set, check
+        // that no new delete files have been added for partitions containing
+        // files being rewritten. This mirrors Java's
+        // `validateNoNewDeletesForDataFiles()` in MergingSnapshotProducer.
+        if let Some(data_seq_num) = self.data_sequence_number {
+            let rewrite_partitions: HashSet<&Struct> =
+                self.files_to_delete.iter().map(|f| f.partition()).collect();
+
+            for manifest_file in manifest_list.entries() {
+                if manifest_file.content != ManifestContentType::Deletes {
+                    continue;
+                }
+
+                let manifest = manifest_file
+                    .load_manifest(snapshot_produce.table.file_io())
+                    .await?;
+
+                for entry in manifest.entries() {
+                    let entry_seq = entry.sequence_number().unwrap_or(0);
+                    if entry_seq > data_seq_num
+                        && entry.is_alive()
+                        && rewrite_partitions.contains(entry.data_file().partition())
+                    {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Cannot commit rewrite: found new delete file {} \
+                                 (sequence_number={}) added after the planning snapshot \
+                                 (data_sequence_number={}). A concurrent operation added \
+                                 deletes for data files being rewritten.",
+                                entry.file_path(),
+                                entry_seq,
+                                data_seq_num,
+                            ),
+                        ));
+                    }
+                }
+            }
         }
 
         Ok(delete_entries)

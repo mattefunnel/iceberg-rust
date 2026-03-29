@@ -30,7 +30,7 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Error, ErrorKind, Result};
-use iceberg_actions::FileRewriter;
+use iceberg_actions::{FileRewriter, RewriteFileGroup};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
@@ -69,8 +69,8 @@ impl FileRewriter for DataFusionFileRewriter {
     /// 2. Decodes record batches using `ParquetRecordBatchReaderBuilder`
     /// 3. Writes record batches through the iceberg writer stack
     /// 4. Returns new `DataFile` metadata for the compacted output
-    async fn rewrite_files(&self, table: &Table, group: Vec<DataFile>) -> Result<Vec<DataFile>> {
-        if group.is_empty() {
+    async fn rewrite(&self, table: &Table, group: RewriteFileGroup) -> Result<Vec<DataFile>> {
+        if group.files.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -78,14 +78,12 @@ impl FileRewriter for DataFusionFileRewriter {
         let schema = metadata.current_schema().clone();
         let file_io = table.file_io().clone();
 
-        // Resolve target file size from table properties.
-        let target_file_size = metadata
-            .table_properties()
-            .map(|p| p.write_target_file_size_bytes)
-            .unwrap_or(512 * 1024 * 1024); // 512 MiB default
+        // Use target file size from the group (provided by RewriteDataFiles)
+        let target_file_size = group.target_file_size_bytes;
 
         // Set up the writer stack, mirroring physical_plan/write.rs.
-        let parquet_writer_builder = ParquetWriterBuilder::new(WriterProperties::default(), schema);
+        let parquet_writer_builder =
+            ParquetWriterBuilder::new(WriterProperties::default(), schema.clone());
         let location_generator = DefaultLocationGenerator::new(metadata.clone()).map_err(|e| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -99,21 +97,26 @@ impl FileRewriter for DataFusionFileRewriter {
         );
         let rolling_writer_builder = RollingFileWriterBuilder::new(
             parquet_writer_builder,
-            target_file_size,
+            target_file_size as usize,
             file_io.clone(),
             location_generator,
             file_name_generator,
         );
         let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
-        // Build a single data file writer (unpartitioned — the partition key
-        // from the original files will be preserved because all files in a
-        // group share the same partition).
-        let partition_key = None;
+        // Build a data file writer. The partition key is constructed from the
+        // group's partition value when available.
+        let partition_key = group.partition_value.as_ref().map(|pv| {
+            iceberg::spec::PartitionKey::new(
+                group.partition_spec.as_ref().clone(),
+                schema.clone(),
+                pv.clone(),
+            )
+        });
         let mut writer = data_file_writer_builder.build(partition_key).await?;
 
         // Read each input file and feed its record batches to the writer.
-        for data_file in &group {
+        for data_file in &group.files {
             let file_path = data_file.file_path();
             let input_file = file_io.new_input(file_path)?;
             let file_bytes = input_file.read().await.map_err(|e| {
@@ -217,7 +220,13 @@ mod tests {
         let table = catalog.create_table(&namespace, creation).await.unwrap();
 
         let rewriter = DataFusionFileRewriter::new();
-        let result = rewriter.rewrite_files(&table, Vec::new()).await.unwrap();
+        let empty_group = iceberg_actions::RewriteFileGroup {
+            files: Vec::new(),
+            target_file_size_bytes: 512 * 1024 * 1024,
+            partition_spec: table.metadata().default_partition_spec().clone(),
+            partition_value: None,
+        };
+        let result = rewriter.rewrite(&table, empty_group).await.unwrap();
         assert!(result.is_empty());
     }
 
@@ -322,12 +331,15 @@ mod tests {
 
         // Write file 1: rows (1, "Alice"), (2, "Bob")
         let mut w1 = dfwb.build(None).await.unwrap();
-        let batch1 = datafusion::arrow::array::RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(datafusion::arrow::array::Int32Array::from(vec![1, 2])),
-            Arc::new(datafusion::arrow::array::StringArray::from(vec![
-                "Alice", "Bob",
-            ])),
-        ])
+        let batch1 = datafusion::arrow::array::RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(datafusion::arrow::array::Int32Array::from(vec![1, 2])),
+                Arc::new(datafusion::arrow::array::StringArray::from(vec![
+                    "Alice", "Bob",
+                ])),
+            ],
+        )
         .unwrap();
         w1.write(batch1).await.unwrap();
         let files1 = w1.close().await.unwrap();
@@ -344,10 +356,13 @@ mod tests {
         );
         let dfwb2 = DataFileWriterBuilder::new(rolling2);
         let mut w2 = dfwb2.build(None).await.unwrap();
-        let batch2 = datafusion::arrow::array::RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(datafusion::arrow::array::Int32Array::from(vec![3])),
-            Arc::new(datafusion::arrow::array::StringArray::from(vec!["Charlie"])),
-        ])
+        let batch2 = datafusion::arrow::array::RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(datafusion::arrow::array::Int32Array::from(vec![3])),
+                Arc::new(datafusion::arrow::array::StringArray::from(vec!["Charlie"])),
+            ],
+        )
         .unwrap();
         w2.write(batch2).await.unwrap();
         let files2 = w2.close().await.unwrap();
@@ -362,7 +377,13 @@ mod tests {
         assert_eq!(total_input_records, 3);
 
         let rewriter = DataFusionFileRewriter::new();
-        let new_files = rewriter.rewrite_files(&table, input_files).await.unwrap();
+        let rewrite_group = iceberg_actions::RewriteFileGroup {
+            files: input_files,
+            target_file_size_bytes: 512 * 1024 * 1024,
+            partition_spec: table.metadata().default_partition_spec().clone(),
+            partition_value: Some(Struct::empty()),
+        };
+        let new_files = rewriter.rewrite(&table, rewrite_group).await.unwrap();
 
         // Verify output: should have at least one file, total records = 3.
         assert!(!new_files.is_empty(), "Expected at least one output file");

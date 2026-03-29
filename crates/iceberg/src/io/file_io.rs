@@ -17,6 +17,7 @@
 
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -26,6 +27,20 @@ use super::storage::{
     LocalFsStorageFactory, MemoryStorageFactory, Storage, StorageConfig, StorageFactory,
 };
 use crate::Result;
+
+/// A file entry returned by [`FileIO::list_with_metadata`], carrying optional
+/// metadata alongside the file path. Storage backends that return metadata
+/// from list operations populate `last_modified` and `size`; others return
+/// `None`.
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    /// Absolute file path.
+    pub path: String,
+    /// Last modification time, if available from the storage backend.
+    pub last_modified: Option<SystemTime>,
+    /// File size in bytes, if available from the storage backend.
+    pub size: Option<u64>,
+}
 
 /// FileIO implementation, used to manipulate files in underlying storage.
 ///
@@ -193,6 +208,29 @@ impl FileIO {
         prefix: impl AsRef<str>,
     ) -> Result<BoxStream<'static, Result<String>>> {
         self.get_storage()?.list(prefix.as_ref()).await
+    }
+
+    /// List all files under the given prefix, returning metadata when available.
+    ///
+    /// Returns a stream of [`FileEntry`] objects containing the file path and
+    /// optional metadata (modification time, size). Storage backends that
+    /// support returning metadata from list operations (e.g., S3 ListObjectsV2)
+    /// will populate these fields. Others return `None`.
+    ///
+    /// This method currently wraps [`FileIO::list()`] and returns `None` for
+    /// metadata fields. Storage-specific optimizations can be added later.
+    pub async fn list_with_metadata(
+        &self,
+        prefix: impl AsRef<str>,
+    ) -> Result<BoxStream<'static, Result<FileEntry>>> {
+        let stream = self.get_storage()?.list(prefix.as_ref()).await?;
+        Ok(Box::pin(stream.map(|result| {
+            result.map(|path| FileEntry {
+                path,
+                last_modified: None,
+                size: None,
+            })
+        })))
     }
 }
 

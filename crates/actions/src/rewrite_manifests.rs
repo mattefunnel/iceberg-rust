@@ -17,12 +17,19 @@
 
 //! Rewrite manifests action — merges small manifest files into larger ones
 //! to speed up query planning. No data files are changed.
+//!
+//! Key correctness properties:
+//! - Data and delete manifests are never merged across content types.
+//! - Manifests with different partition spec IDs are never merged.
+//! - Output shaping produces multiple output manifests when the merged
+//!   result would exceed `target_size_bytes`.
 
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 use iceberg::spec::{
-    FormatVersion, MAIN_BRANCH, ManifestFile, ManifestListWriter, ManifestWriterBuilder, Operation,
-    Snapshot, SnapshotReference, SnapshotRetention, Summary,
+    FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestFile, ManifestListWriter,
+    ManifestWriterBuilder, Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary,
 };
 use iceberg::table::Table;
 use iceberg::{Catalog, Error, ErrorKind, Result, TableCommit, TableRequirement, TableUpdate};
@@ -43,14 +50,17 @@ pub struct RewriteManifestsResult {
 /// Action that merges small manifest files into larger ones.
 ///
 /// This action reads the manifest list of the current snapshot, identifies
-/// manifests below the target size threshold for a given partition spec,
-/// and rewrites them into fewer, larger manifest files. A new snapshot is
-/// committed with the merged manifest list.
+/// manifests below the target size threshold, and rewrites them into fewer,
+/// larger manifest files. A new snapshot is committed with the merged
+/// manifest list.
+///
+/// Manifests are grouped by (content_type, partition_spec_id) before merging
+/// so that data and delete manifests are never mixed, and manifests with
+/// different partition specs are never merged.
 pub struct RewriteManifests<'a> {
     table: &'a Table,
     catalog: &'a dyn Catalog,
     target_size_bytes: u64,
-    spec_id: Option<i32>,
 }
 
 impl<'a> RewriteManifests<'a> {
@@ -60,7 +70,6 @@ impl<'a> RewriteManifests<'a> {
             table,
             catalog,
             target_size_bytes: DEFAULT_TARGET_SIZE_BYTES,
-            spec_id: None,
         }
     }
 
@@ -68,14 +77,6 @@ impl<'a> RewriteManifests<'a> {
     /// this threshold are candidates for merging. Defaults to 8 MiB.
     pub fn target_size_bytes(mut self, target_size_bytes: u64) -> Self {
         self.target_size_bytes = target_size_bytes;
-        self
-    }
-
-    /// Set the partition spec ID to target. Only manifests matching this
-    /// spec ID will be considered for merging. Defaults to the table's
-    /// current default partition spec ID.
-    pub fn spec_id(mut self, spec_id: i32) -> Self {
-        self.spec_id = Some(spec_id);
         self
     }
 
@@ -90,93 +91,151 @@ impl<'a> RewriteManifests<'a> {
         };
 
         let file_io = self.table.file_io();
-        let target_spec_id = self
-            .spec_id
-            .unwrap_or_else(|| metadata.default_partition_spec_id());
 
         // Load the current manifest list.
         let manifest_list = current_snapshot
             .load_manifest_list(file_io, metadata)
             .await?;
 
-        // Partition manifests: small ones matching target spec vs the rest.
-        let mut small_manifests: Vec<&ManifestFile> = Vec::new();
+        // Group manifests by (content_type, spec_id). Within each group,
+        // separate "small" candidates from "kept" manifests.
+        type GroupKey = (ManifestContentType, i32);
+        let mut small_by_group: HashMap<GroupKey, Vec<&ManifestFile>> = HashMap::new();
         let mut kept_manifests: Vec<ManifestFile> = Vec::new();
 
         for manifest_file in manifest_list.entries() {
-            if manifest_file.partition_spec_id == target_spec_id
-                && (manifest_file.manifest_length as u64) < self.target_size_bytes
-            {
-                small_manifests.push(manifest_file);
+            let key: GroupKey = (manifest_file.content, manifest_file.partition_spec_id);
+
+            if (manifest_file.manifest_length as u64) < self.target_size_bytes {
+                small_by_group.entry(key).or_default().push(manifest_file);
             } else {
                 kept_manifests.push(manifest_file.clone());
             }
         }
 
-        // If 0 or 1 small manifests, nothing to merge.
-        if small_manifests.len() <= 1 {
-            return Ok(RewriteManifestsResult::default());
-        }
-
-        let rewritten_count = small_manifests.len() as u32;
-
-        // Read all entries from small manifests.
-        let mut all_entries = Vec::new();
-        for manifest_file in &small_manifests {
-            let manifest = manifest_file.load_manifest(file_io).await?;
-            for entry in manifest.entries() {
-                if entry.is_alive() {
-                    all_entries.push(entry.clone());
+        // For groups with 0 or 1 small manifests, nothing to merge — keep them.
+        let mut groups_to_merge: Vec<(GroupKey, Vec<&ManifestFile>)> = Vec::new();
+        for (key, manifests) in small_by_group {
+            if manifests.len() <= 1 {
+                for m in manifests {
+                    kept_manifests.push(m.clone());
                 }
+            } else {
+                groups_to_merge.push((key, manifests));
             }
         }
 
-        // Generate a unique snapshot ID.
-        let snapshot_id = generate_unique_snapshot_id(self.table);
-        let commit_uuid = Uuid::now_v7();
-
-        // Write merged manifest(s).
-        let schema = metadata.current_schema().clone();
-        let partition_spec = metadata.default_partition_spec().as_ref().clone();
-
-        let manifest_path = format!("{}/metadata/{}-m0.avro", metadata.location(), commit_uuid);
-        let output_file = file_io.new_output(&manifest_path)?;
-        let builder = ManifestWriterBuilder::new(
-            output_file,
-            Some(snapshot_id),
-            None,
-            schema.clone(),
-            partition_spec,
-        );
-        let mut writer = match metadata.format_version() {
-            FormatVersion::V1 => builder.build_v1(),
-            FormatVersion::V2 => builder.build_v2_data(),
-            FormatVersion::V3 => builder.build_v3_data(),
-        };
-
-        for entry in &all_entries {
-            let snapshot_id = entry.snapshot_id().ok_or_else(|| {
-                Error::new(ErrorKind::DataInvalid, "Manifest entry missing snapshot_id")
-            })?;
-            let sequence_number = entry.sequence_number().unwrap_or(0);
-            let file_sequence_number = entry.file_sequence_number;
-            writer.add_existing_file(
-                entry.data_file().clone(),
-                snapshot_id,
-                sequence_number,
-                file_sequence_number,
-            )?;
+        if groups_to_merge.is_empty() {
+            return Ok(RewriteManifestsResult::default());
         }
 
-        let merged_manifest_file = writer.write_manifest_file().await?;
+        // Generate a unique snapshot ID for the new snapshot.
+        let snapshot_id = generate_unique_snapshot_id(self.table);
+        let commit_uuid = Uuid::now_v7();
+        let schema = metadata.current_schema().clone();
+        let mut manifest_counter = 0u64;
+        let mut rewritten_count = 0u32;
+        let mut added_count = 0u32;
+        let mut new_merged_manifests: Vec<ManifestFile> = Vec::new();
 
-        // Build the new manifest list: kept manifests + merged manifest.
-        let mut new_manifest_files = kept_manifests;
-        new_manifest_files.push(merged_manifest_file);
+        for ((content_type, spec_id), small_manifests) in &groups_to_merge {
+            rewritten_count += small_manifests.len() as u32;
 
-        let added_count = 1u32;
+            // Look up the partition spec for this group
+            let partition_spec = metadata
+                .partition_spec_by_id(*spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Partition spec {} not found in table metadata", spec_id),
+                    )
+                })?
+                .as_ref()
+                .clone();
 
-        // Write the new manifest list.
+            // Read all entries from small manifests in this group
+            let mut all_entries = Vec::new();
+            for manifest_file in small_manifests {
+                let manifest = manifest_file.load_manifest(file_io).await?;
+                for entry in manifest.entries() {
+                    if entry.is_alive() {
+                        all_entries.push(entry.clone());
+                    }
+                }
+            }
+
+            if all_entries.is_empty() {
+                continue;
+            }
+
+            // Output shaping: compute how many output manifests to produce.
+            let total_manifest_size: u64 = small_manifests
+                .iter()
+                .map(|m| m.manifest_length as u64)
+                .sum();
+            let target_count = total_manifest_size
+                .saturating_add(self.target_size_bytes.saturating_sub(1))
+                .checked_div(self.target_size_bytes)
+                .unwrap_or(1)
+                .max(1) as usize;
+            let entries_per_manifest = all_entries.len().div_ceil(target_count);
+
+            // Write output manifests, splitting entries across them
+            for chunk in all_entries.chunks(entries_per_manifest.max(1)) {
+                let manifest_path = format!(
+                    "{}/metadata/{}-m{}.avro",
+                    metadata.location(),
+                    commit_uuid,
+                    manifest_counter
+                );
+                manifest_counter += 1;
+
+                let output_file = file_io.new_output(&manifest_path)?;
+                let builder = ManifestWriterBuilder::new(
+                    output_file,
+                    Some(snapshot_id),
+                    None,
+                    schema.clone(),
+                    partition_spec.clone(),
+                );
+
+                let mut writer = match metadata.format_version() {
+                    FormatVersion::V1 => builder.build_v1(),
+                    FormatVersion::V2 => match content_type {
+                        ManifestContentType::Data => builder.build_v2_data(),
+                        ManifestContentType::Deletes => builder.build_v2_deletes(),
+                    },
+                    FormatVersion::V3 => match content_type {
+                        ManifestContentType::Data => builder.build_v3_data(),
+                        ManifestContentType::Deletes => builder.build_v3_deletes(),
+                    },
+                };
+
+                for entry in chunk {
+                    let entry_snapshot_id = entry.snapshot_id().ok_or_else(|| {
+                        Error::new(ErrorKind::DataInvalid, "Manifest entry missing snapshot_id")
+                    })?;
+                    let sequence_number = entry.sequence_number().unwrap_or(0);
+                    let file_sequence_number = entry.file_sequence_number;
+                    writer.add_existing_file(
+                        entry.data_file().clone(),
+                        entry_snapshot_id,
+                        sequence_number,
+                        file_sequence_number,
+                    )?;
+                }
+
+                let merged_manifest = writer.write_manifest_file().await?;
+                new_merged_manifests.push(merged_manifest);
+                added_count += 1;
+            }
+        }
+
+        // Build the final manifest list: kept manifests + new merged manifests
+        let mut final_manifests = kept_manifests;
+        final_manifests.extend(new_merged_manifests);
+
+        // Write the new manifest list
         let next_seq_num = metadata.next_sequence_number();
         let manifest_list_path = format!(
             "{}/metadata/snap-{}-0-{}.avro",
@@ -210,10 +269,11 @@ impl<'a> RewriteManifests<'a> {
             }
         };
 
-        manifest_list_writer.add_manifests(new_manifest_files.into_iter())?;
+        manifest_list_writer.add_manifests(final_manifests.into_iter())?;
         manifest_list_writer.close().await?;
 
-        // Build the new snapshot.
+        // Build the new snapshot — inherit summary from parent since no data
+        // files changed.
         let commit_ts = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -233,7 +293,10 @@ impl<'a> RewriteManifests<'a> {
             .with_timestamp_ms(commit_ts)
             .build();
 
-        // Commit via catalog.
+        // Commit via catalog
+        // TODO: Migrate to shared snapshot-production commit path
+        // (RewriteManifestsAction / SnapshotProducer) once the producer
+        // supports pre-written manifests with correct snapshot_id assignment.
         let table_commit = TableCommit::builder()
             .ident(self.table.identifier().clone())
             .updates(vec![

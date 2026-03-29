@@ -398,10 +398,11 @@ impl<'a> SnapshotProducer<'a> {
             );
         }
 
-        let previous_snapshot = table_metadata
-            .snapshot_by_id(self.snapshot_id)
-            .and_then(|snapshot| snapshot.parent_snapshot_id())
-            .and_then(|parent_id| table_metadata.snapshot_by_id(parent_id));
+        // Use the current snapshot as the parent for summary inheritance.
+        // The previous code incorrectly looked up self.snapshot_id (the new
+        // snapshot being created, which doesn't exist in metadata yet) instead
+        // of the current snapshot whose totals should be inherited.
+        let previous_snapshot = table_metadata.current_snapshot();
 
         let mut additional_properties = summary_collector.build();
         additional_properties.extend(self.snapshot_properties.clone());

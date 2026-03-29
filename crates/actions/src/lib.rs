@@ -25,6 +25,8 @@ pub mod rewrite_data_files;
 pub mod rewrite_manifests;
 
 pub use expire_snapshots::{ExpireSnapshots, ExpireSnapshotsResult};
-pub use remove_orphan_files::{RemoveOrphanFiles, RemoveOrphanFilesResult};
-pub use rewrite_data_files::{FileRewriter, RewriteDataFiles, RewriteDataFilesResult};
+pub use remove_orphan_files::{PrefixMismatchMode, RemoveOrphanFiles, RemoveOrphanFilesResult};
+pub use rewrite_data_files::{
+    FileRewriter, RewriteDataFiles, RewriteDataFilesResult, RewriteFileGroup,
+};
 pub use rewrite_manifests::{RewriteManifests, RewriteManifestsResult};

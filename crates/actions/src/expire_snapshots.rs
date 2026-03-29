@@ -124,6 +124,14 @@ impl<'a> ExpireSnapshots<'a> {
         }
 
         // 2. Compute the set of retained snapshot IDs
+        //
+        // NOTE: Branch/tag-aware retention is not yet implemented.
+        // Current behavior: retain ref heads, retain_last ancestors of main,
+        // and snapshots newer than older_than.
+        // Missing vs Java: per-branch minSnapshotsToKeep, per-branch
+        // maxSnapshotAgeMs, maxRefAgeMs for ref expiration, and independent
+        // branch history traversal.
+        // See: plans/address-initial-review-claude-no-branches/07-out-of-scope-branches-tags.md
 
         // 2a. Collect all snapshot IDs referenced by branches/tags
         let mut retained_ids: HashSet<i64> = HashSet::new();
@@ -161,6 +169,10 @@ impl<'a> ExpireSnapshots<'a> {
         }
 
         // 2d. Explicitly requested snapshot IDs are always expired
+        // TODO: When branch/tag support is added, validate that explicitly
+        // targeted snapshot IDs are not the head of any live branch or tag.
+        // Java's RemoveSnapshots throws if this is attempted.
+        // See: plans/address-initial-review-claude-no-branches/07-out-of-scope-branches-tags.md
         for &sid in &self.snapshot_ids {
             retained_ids.remove(&sid);
         }
@@ -219,7 +231,13 @@ impl<'a> ExpireSnapshots<'a> {
         let file_io = self.table.file_io();
         let mut result = ExpireSnapshotsResult::default();
 
-        // Build the set of live files from retained snapshots
+        // ── Pass 1: Discovery (before any deletes) ──────────────────────
+        //
+        // Build the set of live files from retained snapshots. This now
+        // includes BOTH data and delete manifests (the previous code only
+        // walked DATA manifests, so delete files from retained snapshots
+        // could be incorrectly identified as candidates for deletion).
+
         let mut live_data_files: HashSet<String> = HashSet::new();
         let mut live_manifest_paths: HashSet<String> = HashSet::new();
         let mut live_manifest_list_paths: HashSet<String> = HashSet::new();
@@ -231,6 +249,7 @@ impl<'a> ExpireSnapshots<'a> {
             live_manifest_list_paths.insert(snapshot.manifest_list().to_string());
             let manifest_list = snapshot.load_manifest_list(file_io, metadata).await?;
             for manifest_file in manifest_list.entries() {
+                // Include ALL manifests (data AND delete) in the live set
                 live_manifest_paths.insert(manifest_file.manifest_path.clone());
                 let manifest_bytes = file_io
                     .new_input(&manifest_file.manifest_path)?
@@ -246,87 +265,101 @@ impl<'a> ExpireSnapshots<'a> {
             }
         }
 
-        // Walk expired snapshots and delete files not in the live sets
-        let mut deleted_manifests: HashSet<String> = HashSet::new();
-        let mut deleted_manifest_lists: HashSet<String> = HashSet::new();
-        let mut deleted_data: HashSet<String> = HashSet::new();
+        // Discover candidate files from expired snapshots. We read all
+        // manifests and manifest lists BEFORE deleting anything. This fixes
+        // the prior bug where a manifest list was deleted and then the code
+        // tried to read it to discover what else to clean up.
+        struct CandidateFile {
+            path: String,
+            content_type: DataContentType,
+        }
+
+        let mut candidate_data_files: Vec<CandidateFile> = Vec::new();
+        let mut candidate_manifests: HashSet<String> = HashSet::new();
+        let mut candidate_manifest_lists: HashSet<String> = HashSet::new();
 
         for snapshot in metadata.snapshots() {
             if !expired_id_set.contains(&snapshot.snapshot_id()) {
                 continue;
             }
 
-            // Delete manifest list if not live
+            // Collect manifest list path
             let manifest_list_path = snapshot.manifest_list().to_string();
-            if !live_manifest_list_paths.contains(&manifest_list_path)
-                && deleted_manifest_lists.insert(manifest_list_path.clone())
-            {
-                let _ = file_io.delete(&manifest_list_path).await;
-                result.deleted_manifest_lists_count += 1;
-            }
+            candidate_manifest_lists.insert(manifest_list_path);
 
-            // Load the manifest list to find manifests and data files
-            let manifest_list_bytes = match file_io.new_input(snapshot.manifest_list()) {
-                Ok(input) => match input.read().await {
-                    Ok(bytes) => bytes,
-                    Err(_) => continue, // already deleted or unreachable
-                },
-                Err(_) => continue,
-            };
-            let manifest_list = match iceberg::spec::ManifestList::parse_with_version(
-                &manifest_list_bytes,
-                metadata.format_version(),
-            ) {
-                Ok(ml) => ml,
-                Err(_) => continue,
-            };
+            // Load the manifest list to discover manifests and data/delete files
+            let manifest_list = snapshot.load_manifest_list(file_io, metadata).await?;
 
             for manifest_file in manifest_list.entries() {
-                // Delete manifest if not live
-                if !live_manifest_paths.contains(&manifest_file.manifest_path)
-                    && deleted_manifests.insert(manifest_file.manifest_path.clone())
-                {
-                    // Read the manifest to find data files before deleting it
-                    if let Ok(input) = file_io.new_input(&manifest_file.manifest_path)
-                        && let Ok(manifest_bytes) = input.read().await
-                        && let Ok((_meta, entries)) =
-                            iceberg::spec::Manifest::try_from_avro_bytes(&manifest_bytes)
-                    {
-                        for entry in &entries {
-                            let file_path = entry.data_file.file_path().to_string();
-                            if !live_data_files.contains(&file_path)
-                                && deleted_data.insert(file_path.clone())
-                            {
-                                let _ = file_io.delete(&file_path).await;
-                                match entry.data_file.content_type() {
-                                    DataContentType::Data => {
-                                        result.deleted_data_files_count += 1;
-                                    }
-                                    DataContentType::PositionDeletes => {
-                                        result.deleted_position_delete_files_count += 1;
-                                    }
-                                    DataContentType::EqualityDeletes => {
-                                        result.deleted_equality_delete_files_count += 1;
-                                    }
-                                }
-                            }
-                        }
+                // Include ALL manifests (data AND delete) in candidates
+                if candidate_manifests.insert(manifest_file.manifest_path.clone()) {
+                    let manifest_bytes = file_io
+                        .new_input(&manifest_file.manifest_path)?
+                        .read()
+                        .await?;
+                    let (_meta, entries) =
+                        iceberg::spec::Manifest::try_from_avro_bytes(&manifest_bytes)?;
+                    for entry in &entries {
+                        candidate_data_files.push(CandidateFile {
+                            path: entry.data_file.file_path().to_string(),
+                            content_type: entry.data_file.content_type(),
+                        });
                     }
-                    let _ = file_io.delete(&manifest_file.manifest_path).await;
-                    result.deleted_manifest_files_count += 1;
                 }
             }
         }
 
-        // Delete statistics files for expired snapshots
+        // ── Between passes: Subtract live files ─────────────────────────
+
+        // Remove any path that appears in the live sets
+        candidate_data_files.retain(|f| !live_data_files.contains(&f.path));
+        candidate_manifests.retain(|p| !live_manifest_paths.contains(p));
+        candidate_manifest_lists.retain(|p| !live_manifest_list_paths.contains(p));
+
+        // Deduplicate data/delete file paths (a file can appear in multiple
+        // expired snapshots)
+        let mut seen_data_paths: HashSet<String> = HashSet::new();
+        candidate_data_files.retain(|f| seen_data_paths.insert(f.path.clone()));
+
+        // ── Pass 2: Deletion (leaf-to-root ordering) ────────────────────
+        //
+        // Delete order: data/delete files → manifests → manifest lists →
+        // statistics. A crash at any point leaves only already-unreferenced
+        // files behind, not dangling references to deleted files.
+
+        // 1. Data files and delete files (leaf nodes)
+        for file in &candidate_data_files {
+            let _ = file_io.delete(&file.path).await;
+            match file.content_type {
+                DataContentType::Data => result.deleted_data_files_count += 1,
+                DataContentType::PositionDeletes => {
+                    result.deleted_position_delete_files_count += 1;
+                }
+                DataContentType::EqualityDeletes => {
+                    result.deleted_equality_delete_files_count += 1;
+                }
+            }
+        }
+
+        // 2. Manifests (reference data files, but data files already deleted)
+        for manifest_path in &candidate_manifests {
+            let _ = file_io.delete(manifest_path).await;
+            result.deleted_manifest_files_count += 1;
+        }
+
+        // 3. Manifest lists (reference manifests, but manifests already deleted)
+        for manifest_list_path in &candidate_manifest_lists {
+            let _ = file_io.delete(manifest_list_path).await;
+            result.deleted_manifest_lists_count += 1;
+        }
+
+        // 4. Statistics and partition statistics files
         for stat in metadata.statistics_iter() {
             if expired_id_set.contains(&stat.snapshot_id) {
                 let _ = file_io.delete(&stat.statistics_path).await;
                 result.deleted_statistics_files_count += 1;
             }
         }
-
-        // Delete partition statistics files for expired snapshots
         for pstat in metadata.partition_statistics_iter() {
             if expired_id_set.contains(&pstat.snapshot_id) {
                 let _ = file_io.delete(&pstat.statistics_path).await;
