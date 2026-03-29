@@ -595,6 +595,7 @@ impl ArrowReader {
         let mut reader = ArrowFileReader::new(
             FileMetadata {
                 size: file_size_in_bytes,
+                last_modified: None,
             },
             parquet_reader,
         )
@@ -4550,13 +4551,18 @@ message schema {
         let expected_0 = mock.data.slice(0..100);
         let expected_1 = mock.data.slice(1500..1600);
 
-        let mut reader =
-            super::ArrowFileReader::new(crate::io::FileMetadata { size: 2048 }, Box::new(mock))
-                .with_parquet_read_options(
-                    super::ParquetReadOptions::builder()
-                        .with_range_coalesce_bytes(0)
-                        .build(),
-                );
+        let mut reader = super::ArrowFileReader::new(
+            crate::io::FileMetadata {
+                size: 2048,
+                last_modified: None,
+            },
+            Box::new(mock),
+        )
+        .with_parquet_read_options(
+            super::ParquetReadOptions::builder()
+                .with_range_coalesce_bytes(0)
+                .build(),
+        );
 
         let result = reader
             .get_byte_ranges(vec![0..100, 1500..1600])
@@ -4577,13 +4583,18 @@ message schema {
         let expected_1 = mock.data.slice(200..300);
         let expected_2 = mock.data.slice(500..600);
 
-        let mut reader =
-            super::ArrowFileReader::new(crate::io::FileMetadata { size: 1024 }, Box::new(mock))
-                .with_parquet_read_options(
-                    super::ParquetReadOptions::builder()
-                        .with_range_coalesce_bytes(1024)
-                        .build(),
-                );
+        let mut reader = super::ArrowFileReader::new(
+            crate::io::FileMetadata {
+                size: 1024,
+                last_modified: None,
+            },
+            Box::new(mock),
+        )
+        .with_parquet_read_options(
+            super::ParquetReadOptions::builder()
+                .with_range_coalesce_bytes(1024)
+                .build(),
+        );
 
         // All ranges within coalesce threshold — should merge into one fetch.
         let result = reader
@@ -4602,8 +4613,13 @@ message schema {
         use parquet::arrow::async_reader::AsyncFileReader;
 
         let mock = MockFileRead::new(1024);
-        let mut reader =
-            super::ArrowFileReader::new(crate::io::FileMetadata { size: 1024 }, Box::new(mock));
+        let mut reader = super::ArrowFileReader::new(
+            crate::io::FileMetadata {
+                size: 1024,
+                last_modified: None,
+            },
+            Box::new(mock),
+        );
 
         let result = reader.get_byte_ranges(vec![]).await.unwrap();
         assert!(result.is_empty());
@@ -4617,13 +4633,18 @@ message schema {
         let expected_0 = mock.data.slice(0..100);
         let expected_1 = mock.data.slice(1500..1600);
 
-        let mut reader =
-            super::ArrowFileReader::new(crate::io::FileMetadata { size: 2048 }, Box::new(mock))
-                .with_parquet_read_options(
-                    super::ParquetReadOptions::builder()
-                        .with_range_coalesce_bytes(u64::MAX)
-                        .build(),
-                );
+        let mut reader = super::ArrowFileReader::new(
+            crate::io::FileMetadata {
+                size: 2048,
+                last_modified: None,
+            },
+            Box::new(mock),
+        )
+        .with_parquet_read_options(
+            super::ParquetReadOptions::builder()
+                .with_range_coalesce_bytes(u64::MAX)
+                .build(),
+        );
 
         // u64::MAX coalesce — all ranges merge into a single fetch.
         let result = reader
@@ -4644,13 +4665,18 @@ message schema {
         let mock = MockFileRead::new(1024);
         let expected = mock.data.slice(0..100);
 
-        let mut reader =
-            super::ArrowFileReader::new(crate::io::FileMetadata { size: 1024 }, Box::new(mock))
-                .with_parquet_read_options(
-                    super::ParquetReadOptions::builder()
-                        .with_range_fetch_concurrency(0)
-                        .build(),
-                );
+        let mut reader = super::ArrowFileReader::new(
+            crate::io::FileMetadata {
+                size: 1024,
+                last_modified: None,
+            },
+            Box::new(mock),
+        )
+        .with_parquet_read_options(
+            super::ParquetReadOptions::builder()
+                .with_range_fetch_concurrency(0)
+                .build(),
+        );
 
         let result = reader
             .get_byte_ranges(vec![0..100, 200..300])
@@ -4669,14 +4695,19 @@ message schema {
         let expected_1 = mock.data.slice(500..600);
         let expected_2 = mock.data.slice(1500..1600);
 
-        let mut reader =
-            super::ArrowFileReader::new(crate::io::FileMetadata { size: 2048 }, Box::new(mock))
-                .with_parquet_read_options(
-                    super::ParquetReadOptions::builder()
-                        .with_range_coalesce_bytes(0)
-                        .with_range_fetch_concurrency(1)
-                        .build(),
-                );
+        let mut reader = super::ArrowFileReader::new(
+            crate::io::FileMetadata {
+                size: 2048,
+                last_modified: None,
+            },
+            Box::new(mock),
+        )
+        .with_parquet_read_options(
+            super::ParquetReadOptions::builder()
+                .with_range_coalesce_bytes(0)
+                .with_range_fetch_concurrency(1)
+                .build(),
+        );
 
         // concurrency=1 with no coalescing — sequential fetches.
         let result = reader

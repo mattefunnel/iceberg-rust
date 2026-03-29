@@ -119,6 +119,7 @@ impl Storage for MemoryStorage {
         match data.get(&normalized) {
             Some(bytes) => Ok(FileMetadata {
                 size: bytes.len() as u64,
+                last_modified: None,
             }),
             None => Err(Error::new(
                 ErrorKind::DataInvalid,

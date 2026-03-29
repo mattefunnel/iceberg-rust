@@ -107,6 +107,7 @@ impl Storage for LocalFsStorage {
         })?;
         Ok(FileMetadata {
             size: metadata.len(),
+            last_modified: metadata.modified().ok(),
         })
     }
 

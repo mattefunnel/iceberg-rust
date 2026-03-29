@@ -453,6 +453,10 @@ impl Storage for OpenDalStorage {
         let meta = op.stat(relative_path).await.map_err(from_opendal_error)?;
         Ok(FileMetadata {
             size: meta.content_length(),
+            last_modified: meta.last_modified().map(|dt| {
+                std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(dt.timestamp() as u64)
+            }),
         })
     }
 

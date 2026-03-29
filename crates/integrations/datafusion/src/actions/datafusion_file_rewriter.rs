@@ -20,6 +20,8 @@
 //! parquet files during bin-pack compaction.
 
 use async_trait::async_trait;
+use futures::StreamExt;
+use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::spec::{DataFile, DataFileFormat};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -31,7 +33,6 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Error, ErrorKind, Result};
 use iceberg_actions::{FileRewriter, RewriteFileGroup};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
@@ -64,13 +65,13 @@ impl Default for DataFusionFileRewriter {
 impl FileRewriter for DataFusionFileRewriter {
     /// Rewrite a group of data files into new, compacted data files.
     ///
-    /// For each input file this method:
-    /// 1. Reads the raw parquet bytes via the table's `FileIO`
-    /// 2. Decodes record batches using `ParquetRecordBatchReaderBuilder`
-    /// 3. Writes record batches through the iceberg writer stack
-    /// 4. Returns new `DataFile` metadata for the compacted output
+    /// This method:
+    /// 1. Reads through Iceberg's [`ArrowReaderBuilder`] which automatically
+    ///    applies position and equality deletes
+    /// 2. Writes record batches through the iceberg writer stack
+    /// 3. Returns new `DataFile` metadata for the compacted output
     async fn rewrite(&self, table: &Table, group: RewriteFileGroup) -> Result<Vec<DataFile>> {
-        if group.files.is_empty() {
+        if group.tasks.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -81,7 +82,7 @@ impl FileRewriter for DataFusionFileRewriter {
         // Use target file size from the group (provided by RewriteDataFiles)
         let target_file_size = group.target_file_size_bytes;
 
-        // Set up the writer stack, mirroring physical_plan/write.rs.
+        // Set up the writer stack
         let parquet_writer_builder =
             ParquetWriterBuilder::new(WriterProperties::default(), schema.clone());
         let location_generator = DefaultLocationGenerator::new(metadata.clone()).map_err(|e| {
@@ -104,51 +105,25 @@ impl FileRewriter for DataFusionFileRewriter {
         );
         let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
-        // Build a data file writer. The partition key is constructed from the
-        // group's partition value when available.
         let partition_key = group.partition_value.as_ref().map(|pv| {
             iceberg::spec::PartitionKey::new(
                 group.partition_spec.as_ref().clone(),
-                schema.clone(),
+                schema,
                 pv.clone(),
             )
         });
         let mut writer = data_file_writer_builder.build(partition_key).await?;
 
-        // Read each input file and feed its record batches to the writer.
-        for data_file in &group.files {
-            let file_path = data_file.file_path();
-            let input_file = file_io.new_input(file_path)?;
-            let file_bytes = input_file.read().await.map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Failed to read input file {file_path}: {e}"),
-                )
-            })?;
+        // Read through Iceberg's delete-aware ArrowReader. This applies
+        // position deletes and equality deletes automatically so that
+        // logically deleted rows do not appear in the compacted output.
+        let task_stream = Box::pin(futures::stream::iter(group.tasks.into_iter().map(Ok)));
+        let arrow_reader = ArrowReaderBuilder::new(file_io).build();
+        let mut record_batch_stream = arrow_reader.read(task_stream)?;
 
-            let reader_builder =
-                ParquetRecordBatchReaderBuilder::try_new(file_bytes).map_err(|e| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        format!("Failed to create parquet reader for {file_path}: {e}"),
-                    )
-                })?;
-            let reader = reader_builder.build().map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Failed to build parquet reader for {file_path}: {e}"),
-                )
-            })?;
-
-            for batch_result in reader {
-                let batch = batch_result.map_err(|e| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        format!("Failed to read record batch from {file_path}: {e}"),
-                    )
-                })?;
-                writer.write(batch).await?;
-            }
+        while let Some(batch_result) = record_batch_stream.next().await {
+            let batch = batch_result?;
+            writer.write(batch).await?;
         }
 
         let data_files = writer.close().await?;
@@ -221,7 +196,7 @@ mod tests {
 
         let rewriter = DataFusionFileRewriter::new();
         let empty_group = iceberg_actions::RewriteFileGroup {
-            files: Vec::new(),
+            tasks: Vec::new(),
             target_file_size_bytes: 512 * 1024 * 1024,
             partition_spec: table.metadata().default_partition_spec().clone(),
             partition_value: None,
@@ -367,7 +342,7 @@ mod tests {
         w2.write(batch2).await.unwrap();
         let files2 = w2.close().await.unwrap();
 
-        // Now we have two DataFile entries. Rewrite them.
+        // Commit the data files via fast-append so plan_files() can find them.
         let mut input_files: Vec<DataFile> = Vec::new();
         input_files.extend(files1);
         input_files.extend(files2);
@@ -376,9 +351,25 @@ mod tests {
         let total_input_records: u64 = input_files.iter().map(|f| f.record_count()).sum();
         assert_eq!(total_input_records, 3);
 
+        let tx = iceberg::transaction::Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(input_files);
+        let tx = iceberg::transaction::ApplyTransactionAction::apply(action, tx).unwrap();
+        let table = tx.commit(&*catalog).await.unwrap();
+
+        // Use plan_files() to get proper FileScanTask objects with delete
+        // association and partition context.
+        let scan = table.scan().select_all().build().unwrap();
+        let tasks: Vec<iceberg::scan::FileScanTask> =
+            futures::StreamExt::collect::<Vec<_>>(scan.plan_files().await.unwrap())
+                .await
+                .into_iter()
+                .collect::<iceberg::Result<Vec<_>>>()
+                .unwrap();
+        assert_eq!(tasks.len(), 2);
+
         let rewriter = DataFusionFileRewriter::new();
         let rewrite_group = iceberg_actions::RewriteFileGroup {
-            files: input_files,
+            tasks,
             target_file_size_bytes: 512 * 1024 * 1024,
             partition_spec: table.metadata().default_partition_spec().clone(),
             partition_value: Some(Struct::empty()),

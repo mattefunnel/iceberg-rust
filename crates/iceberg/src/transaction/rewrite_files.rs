@@ -110,6 +110,7 @@ impl TransactionAction for RewriteFilesAction {
 
         let operation = RewriteFilesOperation {
             files_to_delete: self.files_to_delete.clone(),
+            starting_snapshot_id: self.starting_snapshot_id,
             data_sequence_number: self.data_sequence_number,
         };
 
@@ -121,6 +122,9 @@ impl TransactionAction for RewriteFilesAction {
 
 struct RewriteFilesOperation {
     files_to_delete: Vec<DataFile>,
+    /// If set, the snapshot from which the rewrite was planned. Used to
+    /// validate that the table has not changed incompatibly since planning.
+    starting_snapshot_id: Option<i64>,
     /// If set, validate that no new delete files have been added since this
     /// sequence number for partitions containing files being rewritten.
     /// Mirrors Java's `validateNoNewDeletesForDataFiles()`.
@@ -145,6 +149,37 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
             }
             return Ok(vec![]);
         };
+
+        // Validate that starting_snapshot_id is an ancestor of the current
+        // snapshot. If the table was rolled back or the snapshot was expired,
+        // the rewrite is operating on stale data.
+        if let Some(starting_id) = self.starting_snapshot_id {
+            let mut found = false;
+            let mut cursor = Some(snapshot.snapshot_id());
+            while let Some(sid) = cursor {
+                if sid == starting_id {
+                    found = true;
+                    break;
+                }
+                cursor = snapshot_produce
+                    .table
+                    .metadata()
+                    .snapshot_by_id(sid)
+                    .and_then(|s| s.parent_snapshot_id());
+            }
+            if !found {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot commit rewrite: starting snapshot {} is not an ancestor \
+                         of the current snapshot {}. The table may have been rolled back \
+                         or the snapshot expired.",
+                        starting_id,
+                        snapshot.snapshot_id(),
+                    ),
+                ));
+            }
+        }
 
         let delete_paths: HashSet<&str> =
             self.files_to_delete.iter().map(|f| f.file_path()).collect();

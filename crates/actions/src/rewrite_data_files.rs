@@ -18,14 +18,19 @@
 //! Rewrite data files action — compacts small data files into larger ones
 //! using a pluggable [`FileRewriter`] trait. This is the bin-pack compaction
 //! action analogous to Spark's `RewriteDataFiles`.
+//!
+//! Planning uses [`TableScan::plan_files()`] to get [`FileScanTask`] objects
+//! that carry associated delete files and partition context. The
+//! [`FileRewriter`] can then read through Iceberg's delete-aware
+//! [`ArrowReaderBuilder`] to produce correct output.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use iceberg::spec::{
-    DataContentType, DataFile, ManifestContentType, ManifestStatus, PartitionSpec, Struct,
-};
+use futures::StreamExt;
+use iceberg::scan::FileScanTask;
+use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, PartitionSpec, Struct};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, Error, ErrorKind, Result};
@@ -46,17 +51,17 @@ const DEFAULT_MIN_INPUT_FILES: usize = 5;
 /// Default maximum size of a single file group: 100 GiB.
 const DEFAULT_MAX_FILE_GROUP_SIZE_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 
-/// A group of files to be rewritten together. This provides richer context
-/// to the [`FileRewriter`] than a bare `Vec<DataFile>`, including:
-/// - Target output file size
-/// - Partition spec and value for correct output metadata
+/// A group of files to be rewritten together.
 ///
-/// Future: will also carry `Vec<FileScanTask>` for delete-file association
-/// when the scan-planning migration (Finding 12) is completed.
+/// Each group carries [`FileScanTask`] objects that include associated delete
+/// files and partition context. The [`FileRewriter`] should use Iceberg's
+/// delete-aware reader (e.g. [`ArrowReaderBuilder`]) to read these tasks so
+/// that equality/position deletes are applied during compaction.
 #[derive(Debug, Clone)]
 pub struct RewriteFileGroup {
-    /// The data files in this group.
-    pub files: Vec<DataFile>,
+    /// The scan tasks for files in this group. Each task carries the data
+    /// file path, associated delete files, partition, and schema context.
+    pub tasks: Vec<FileScanTask>,
     /// Target output file size in bytes.
     pub target_file_size_bytes: u64,
     /// The partition spec for this group's files.
@@ -65,16 +70,46 @@ pub struct RewriteFileGroup {
     pub partition_value: Option<Struct>,
 }
 
+impl RewriteFileGroup {
+    /// Build minimal [`DataFile`] stubs from the scan tasks, suitable for
+    /// passing to [`RewriteFilesAction::delete_files()`]. The commit only
+    /// matches by path; the real manifest entry data comes from the manifest.
+    pub fn data_files_for_delete(&self) -> Vec<DataFile> {
+        self.tasks
+            .iter()
+            .map(|task| {
+                DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path(task.data_file_path.clone())
+                    .file_format(task.data_file_format)
+                    .file_size_in_bytes(task.file_size_in_bytes)
+                    .record_count(task.record_count.unwrap_or(0))
+                    .partition(task.partition.clone().unwrap_or_else(Struct::empty))
+                    .partition_spec_id(
+                        task.partition_spec
+                            .as_ref()
+                            .map(|s| s.spec_id())
+                            .unwrap_or(0),
+                    )
+                    .build()
+                    .expect("failed to build DataFile stub from FileScanTask")
+            })
+            .collect()
+    }
+}
+
 /// Pluggable trait for rewriting data files. Any compute engine (DataFusion,
 /// Spark, etc.) implements this to provide the actual file compaction logic.
 ///
-/// The rewriter receives a [`RewriteFileGroup`] containing the input files,
-/// target file size, and partition context. It should produce output files
-/// that collectively contain the same logical data as the input files.
+/// The rewriter receives a [`RewriteFileGroup`] containing [`FileScanTask`]
+/// objects with delete-file associations, target file size, and partition
+/// context. Implementations should use Iceberg's delete-aware reader (e.g.
+/// `ArrowReaderBuilder`) to read the tasks so that logically deleted rows
+/// are excluded from the compacted output.
 #[async_trait]
 pub trait FileRewriter: Send + Sync {
     /// Rewrite a group of data files, producing a new set of (typically fewer,
-    /// larger) data files.
+    /// larger) data files with deletes applied.
     async fn rewrite(&self, table: &Table, group: RewriteFileGroup) -> Result<Vec<DataFile>>;
 }
 
@@ -181,62 +216,55 @@ impl<'a, R: FileRewriter> RewriteDataFiles<'a, R> {
         let planning_snapshot_id = current_snapshot.snapshot_id();
         let planning_sequence_number = current_snapshot.sequence_number();
 
-        let file_io = self.table.file_io();
+        // 2. Use TableScan::plan_files() to get FileScanTask objects.
+        //    Each task carries the data file, associated delete files,
+        //    partition and schema context.
+        let scan = self
+            .table
+            .scan()
+            .snapshot_id(planning_snapshot_id)
+            .select_all()
+            .build()?;
 
-        // 2. Walk all DATA manifests to collect live data files.
-        // TODO: Replace with TableScan::plan_files() for automatic delete-file
-        // association (Finding 12). The current manifest walk correctly
-        // collects DataFile objects needed for the commit, but does not
-        // associate delete files with data files.
-        let manifest_list = current_snapshot
-            .load_manifest_list(file_io, metadata)
-            .await?;
+        let task_stream = scan.plan_files().await?;
+        let tasks: Vec<FileScanTask> = task_stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
 
-        let mut partition_files: HashMap<Struct, Vec<DataFile>> = HashMap::new();
-
-        let mut seen_paths: HashSet<String> = HashSet::new();
-
-        for manifest_file in manifest_list.entries() {
-            if manifest_file.content != ManifestContentType::Data {
-                continue;
-            }
-
-            let manifest = manifest_file.load_manifest(file_io).await?;
-            for entry in manifest.entries() {
-                if entry.content_type() != DataContentType::Data {
-                    continue;
-                }
-                let path = entry.file_path().to_string();
-
-                if !seen_paths.insert(path) {
-                    continue;
-                }
-
-                if entry.status == ManifestStatus::Deleted {
-                    continue;
-                }
-
-                let partition = entry.data_file().partition().clone();
-                partition_files
-                    .entry(partition)
-                    .or_default()
-                    .push(entry.data_file().clone());
-            }
+        // 3. Group tasks by partition value.
+        let mut partition_tasks: HashMap<Struct, Vec<FileScanTask>> = HashMap::new();
+        for task in tasks {
+            let key = task.partition.clone().unwrap_or_else(Struct::empty);
+            partition_tasks.entry(key).or_default().push(task);
         }
 
-        // 3. For each partition, select candidates (undersized or oversized
-        // files only — NOT all files when partition count exceeds threshold).
-        let default_spec = metadata.default_partition_spec();
+        // 4. For each partition, select candidates and bin-pack into groups.
         let mut file_groups: Vec<RewriteFileGroup> = Vec::new();
 
-        for (partition_value, files) in &partition_files {
-            let candidates = self.select_candidates(files);
+        for (partition_value, tasks) in &partition_tasks {
+            let candidates: Vec<&FileScanTask> = tasks
+                .iter()
+                .filter(|t| {
+                    t.file_size_in_bytes < self.min_file_size_bytes
+                        || t.file_size_in_bytes > self.max_file_size_bytes
+                })
+                .collect();
+
             if candidates.len() < self.min_input_files {
                 continue;
             }
 
-            // 4. Bin-pack candidates into groups not exceeding max_file_group_size_bytes.
-            let groups = self.bin_pack(candidates, partition_value, default_spec.clone());
+            // Use the partition spec from the first candidate. All tasks in
+            // this group share the same partition value; the spec may differ
+            // on spec-evolved tables but bin-pack groups within one partition.
+            let spec = candidates
+                .first()
+                .and_then(|t| t.partition_spec.clone())
+                .unwrap_or_else(|| metadata.default_partition_spec().clone());
+
+            let groups = self.bin_pack(candidates, partition_value, spec);
             file_groups.extend(groups);
         }
 
@@ -258,41 +286,26 @@ impl<'a, R: FileRewriter> RewriteDataFiles<'a, R> {
         }
     }
 
-    /// Select candidate files from a single partition. Only undersized or
-    /// oversized files are candidates. This fixes the previous behavior where
-    /// ALL files in a partition became candidates once the partition exceeded
-    /// `min_input_files` (Finding 13).
-    fn select_candidates<'f>(&self, files: &'f [DataFile]) -> Vec<&'f DataFile> {
-        files
-            .iter()
-            .filter(|f| {
-                f.file_size_in_bytes() < self.min_file_size_bytes
-                    || f.file_size_in_bytes() > self.max_file_size_bytes
-            })
-            .collect()
-    }
-
-    /// Bin-pack candidate files into groups, each not exceeding
-    /// `max_file_group_size_bytes` in total size. Each group carries
-    /// target_file_size_bytes and partition context for the rewriter.
+    /// Bin-pack candidate tasks into groups, each not exceeding
+    /// `max_file_group_size_bytes`.
     fn bin_pack(
         &self,
-        candidates: Vec<&DataFile>,
+        candidates: Vec<&FileScanTask>,
         partition_value: &Struct,
         partition_spec: Arc<PartitionSpec>,
     ) -> Vec<RewriteFileGroup> {
         let mut groups: Vec<RewriteFileGroup> = Vec::new();
-        let mut current_files: Vec<DataFile> = Vec::new();
+        let mut current_tasks: Vec<FileScanTask> = Vec::new();
         let mut current_size: u64 = 0;
 
-        for file in candidates {
-            let file_size = file.file_size_in_bytes();
+        for task in candidates {
+            let file_size = task.file_size_in_bytes;
 
-            if !current_files.is_empty()
+            if !current_tasks.is_empty()
                 && current_size + file_size > self.max_file_group_size_bytes
             {
                 groups.push(RewriteFileGroup {
-                    files: std::mem::take(&mut current_files),
+                    tasks: std::mem::take(&mut current_tasks),
                     target_file_size_bytes: self.target_file_size_bytes,
                     partition_spec: partition_spec.clone(),
                     partition_value: Some(partition_value.clone()),
@@ -300,13 +313,13 @@ impl<'a, R: FileRewriter> RewriteDataFiles<'a, R> {
                 current_size = 0;
             }
 
-            current_files.push(file.clone());
+            current_tasks.push(task.clone());
             current_size += file_size;
         }
 
-        if !current_files.is_empty() {
+        if !current_tasks.is_empty() {
             groups.push(RewriteFileGroup {
-                files: current_files,
+                tasks: current_tasks,
                 target_file_size_bytes: self.target_file_size_bytes,
                 partition_spec: partition_spec.clone(),
                 partition_value: Some(partition_value.clone()),
@@ -328,10 +341,12 @@ impl<'a, R: FileRewriter> RewriteDataFiles<'a, R> {
         let mut rewritten_bytes: u64 = 0;
 
         for group in file_groups {
-            for f in &group.files {
-                rewritten_bytes += f.file_size_in_bytes();
-            }
-            let files_to_delete: Vec<DataFile> = group.files.clone();
+            rewritten_bytes += group
+                .tasks
+                .iter()
+                .map(|t| t.file_size_in_bytes)
+                .sum::<u64>();
+            let files_to_delete = group.data_files_for_delete();
             let new_files = self.rewriter.rewrite(self.table, group).await?;
             all_files_to_delete.extend(files_to_delete);
             all_files_to_add.extend(new_files);
@@ -340,13 +355,12 @@ impl<'a, R: FileRewriter> RewriteDataFiles<'a, R> {
         let rewritten_count = all_files_to_delete.len() as u32;
         let added_count = all_files_to_add.len() as u32;
 
-        // Track output file paths for commit-failure cleanup (Finding 8)
+        // Track output file paths for commit-failure cleanup
         let output_file_paths: Vec<String> = all_files_to_add
             .iter()
             .map(|f| f.file_path().to_string())
             .collect();
 
-        // Commit via Transaction + RewriteFilesAction with conflict validation
         let tx = Transaction::new(self.table);
         let action = tx
             .rewrite_files()
@@ -380,8 +394,7 @@ impl<'a, R: FileRewriter> RewriteDataFiles<'a, R> {
         }
     }
 
-    /// Execute each group as an independent commit, allowing partial
-    /// progress even when some groups fail.
+    /// Execute each group as an independent commit, allowing partial progress.
     async fn execute_partial_progress(
         &self,
         file_groups: Vec<RewriteFileGroup>,
@@ -391,9 +404,9 @@ impl<'a, R: FileRewriter> RewriteDataFiles<'a, R> {
         let mut result = RewriteDataFilesResult::default();
 
         for group in file_groups {
-            let group_file_count = group.files.len() as u32;
-            let group_bytes: u64 = group.files.iter().map(|f| f.file_size_in_bytes()).sum();
-            let files_to_delete: Vec<DataFile> = group.files.clone();
+            let group_file_count = group.tasks.len() as u32;
+            let group_bytes: u64 = group.tasks.iter().map(|t| t.file_size_in_bytes).sum();
+            let files_to_delete = group.data_files_for_delete();
 
             match self.rewriter.rewrite(self.table, group).await {
                 Ok(new_files) => {
@@ -403,7 +416,6 @@ impl<'a, R: FileRewriter> RewriteDataFiles<'a, R> {
                         .map(|f| f.file_path().to_string())
                         .collect();
 
-                    // Reload table to get latest metadata for each partial commit.
                     let table = self.catalog.load_table(self.table.identifier()).await?;
 
                     let tx = Transaction::new(&table);
@@ -416,7 +428,6 @@ impl<'a, R: FileRewriter> RewriteDataFiles<'a, R> {
                     let tx = match action.apply(tx) {
                         Ok(tx) => tx,
                         Err(_) => {
-                            // Clean up output files
                             Self::cleanup_files(self.table.file_io(), &output_paths).await;
                             result.failed_data_files_count += group_file_count;
                             continue;
@@ -430,7 +441,6 @@ impl<'a, R: FileRewriter> RewriteDataFiles<'a, R> {
                             result.rewritten_bytes_count += group_bytes;
                         }
                         Err(_) => {
-                            // Clean up output files on commit failure
                             Self::cleanup_files(self.table.file_io(), &output_paths).await;
                             result.failed_data_files_count += group_file_count;
                         }

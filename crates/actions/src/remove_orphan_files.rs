@@ -226,6 +226,10 @@ impl<'a> RemoveOrphanFiles<'a> {
 
         let mut file_stream = file_io.list_with_metadata(scan_location).await?;
 
+        // Extract the scheme://authority prefix from the table location to
+        // detect when a listed file uses a different prefix.
+        let table_prefix = extract_scheme_authority(scan_location);
+
         // 4. Orphans = files in storage NOT in referenced set, filtered by mtime
         let mut orphan_locations: Vec<String> = Vec::new();
         while let Some(file_result) = file_stream.next().await {
@@ -242,6 +246,39 @@ impl<'a> RemoveOrphanFiles<'a> {
 
             if referenced_files.contains(&canonical) || referenced_files.contains(&normalized) {
                 continue;
+            }
+
+            // Prefix mismatch check: if this file's scheme://authority differs
+            // from the table location's prefix and no equivalence resolved it,
+            // consult prefix_mismatch_mode.
+            let file_prefix = extract_scheme_authority(&normalized);
+            if let Some(ref table_pfx) = table_prefix
+                && let Some(ref file_pfx) = file_prefix
+                && file_pfx != table_pfx
+            {
+                // Check if the canonical form matches the table prefix
+                let canonical_prefix = extract_scheme_authority(&canonical);
+                let prefix_matches = canonical_prefix.as_ref() == Some(table_pfx);
+                if !prefix_matches {
+                    match self.prefix_mismatch_mode {
+                        PrefixMismatchMode::Error => {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                format!(
+                                    "Prefix mismatch: file '{}' has scheme/authority '{}' \
+                                     which differs from the table location '{}'. \
+                                     Configure equal_schemes() or equal_authorities() \
+                                     to declare equivalences, or set \
+                                     prefix_mismatch_mode(Ignore) to skip such files.",
+                                    file_entry.path, file_pfx, table_pfx,
+                                ),
+                            ));
+                        }
+                        PrefixMismatchMode::Ignore => {
+                            continue; // Skip this file
+                        }
+                    }
+                }
             }
 
             // Mtime filtering: when mtime is available, skip files newer than
@@ -298,6 +335,14 @@ impl<'a> RemoveOrphanFiles<'a> {
 
         format!("{canonical_scheme}://{canonical_authority}{path}")
     }
+}
+
+/// Extract the "scheme://authority" prefix from a URI, if present.
+/// Returns `None` for bare paths like `/tmp/foo`.
+fn extract_scheme_authority(uri: &str) -> Option<String> {
+    let (scheme, rest) = uri.split_once("://")?;
+    let authority = rest.split('/').next().unwrap_or("");
+    Some(format!("{}://{}", scheme.to_lowercase(), authority))
 }
 
 /// Normalize a URI for consistent comparison: lowercase scheme, strip trailing
