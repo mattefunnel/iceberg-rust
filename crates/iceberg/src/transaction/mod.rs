@@ -68,7 +68,7 @@ use std::time::Duration;
 
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
 pub use rewrite_files::RewriteFilesAction;
-pub use rewrite_manifests_action::RewriteManifestsAction;
+pub use rewrite_manifests_action::{MergedManifestGroup, RewriteManifestsAction};
 
 use crate::error::Result;
 use crate::spec::TableProperties;

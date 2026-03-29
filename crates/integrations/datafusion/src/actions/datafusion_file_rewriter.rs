@@ -306,15 +306,12 @@ mod tests {
 
         // Write file 1: rows (1, "Alice"), (2, "Bob")
         let mut w1 = dfwb.build(None).await.unwrap();
-        let batch1 = datafusion::arrow::array::RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![
-                Arc::new(datafusion::arrow::array::Int32Array::from(vec![1, 2])),
-                Arc::new(datafusion::arrow::array::StringArray::from(vec![
-                    "Alice", "Bob",
-                ])),
-            ],
-        )
+        let batch1 = datafusion::arrow::array::RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(datafusion::arrow::array::Int32Array::from(vec![1, 2])),
+            Arc::new(datafusion::arrow::array::StringArray::from(vec![
+                "Alice", "Bob",
+            ])),
+        ])
         .unwrap();
         w1.write(batch1).await.unwrap();
         let files1 = w1.close().await.unwrap();
@@ -331,13 +328,10 @@ mod tests {
         );
         let dfwb2 = DataFileWriterBuilder::new(rolling2);
         let mut w2 = dfwb2.build(None).await.unwrap();
-        let batch2 = datafusion::arrow::array::RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![
-                Arc::new(datafusion::arrow::array::Int32Array::from(vec![3])),
-                Arc::new(datafusion::arrow::array::StringArray::from(vec!["Charlie"])),
-            ],
-        )
+        let batch2 = datafusion::arrow::array::RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(datafusion::arrow::array::Int32Array::from(vec![3])),
+            Arc::new(datafusion::arrow::array::StringArray::from(vec!["Charlie"])),
+        ])
         .unwrap();
         w2.write(batch2).await.unwrap();
         let files2 = w2.close().await.unwrap();
@@ -354,7 +348,7 @@ mod tests {
         let tx = iceberg::transaction::Transaction::new(&table);
         let action = tx.fast_append().add_data_files(input_files);
         let tx = iceberg::transaction::ApplyTransactionAction::apply(action, tx).unwrap();
-        let table = tx.commit(&*catalog).await.unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
 
         // Use plan_files() to get proper FileScanTask objects with delete
         // association and partition context.

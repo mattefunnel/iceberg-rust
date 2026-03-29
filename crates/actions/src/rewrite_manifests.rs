@@ -23,17 +23,15 @@
 //! - Manifests with different partition spec IDs are never merged.
 //! - Output shaping produces multiple output manifests when the merged
 //!   result would exceed `target_size_bytes`.
+//! - Commits through `RewriteManifestsAction` / `SnapshotProducer` for
+//!   correct summary computation and sequence numbering.
 
 use std::collections::HashMap;
-use std::time::SystemTime;
 
-use iceberg::spec::{
-    FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestFile, ManifestListWriter,
-    ManifestWriterBuilder, Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary,
-};
+use iceberg::spec::{ManifestContentType, ManifestFile};
 use iceberg::table::Table;
-use iceberg::{Catalog, Error, ErrorKind, Result, TableCommit, TableRequirement, TableUpdate};
-use uuid::Uuid;
+use iceberg::transaction::{ApplyTransactionAction, MergedManifestGroup, Transaction};
+use iceberg::{Catalog, Error, ErrorKind, Result};
 
 /// Default target manifest file size: 8 MiB.
 const DEFAULT_TARGET_SIZE_BYTES: u64 = 8 * 1024 * 1024;
@@ -51,8 +49,8 @@ pub struct RewriteManifestsResult {
 ///
 /// This action reads the manifest list of the current snapshot, identifies
 /// manifests below the target size threshold, and rewrites them into fewer,
-/// larger manifest files. A new snapshot is committed with the merged
-/// manifest list.
+/// larger manifest files. A new snapshot is committed via the shared
+/// `SnapshotProducer` through `RewriteManifestsAction`.
 ///
 /// Manifests are grouped by (content_type, partition_spec_id) before merging
 /// so that data and delete manifests are never mixed, and manifests with
@@ -129,19 +127,13 @@ impl<'a> RewriteManifests<'a> {
             return Ok(RewriteManifestsResult::default());
         }
 
-        // Generate a unique snapshot ID for the new snapshot.
-        let snapshot_id = generate_unique_snapshot_id(self.table);
-        let commit_uuid = Uuid::now_v7();
-        let schema = metadata.current_schema().clone();
-        let mut manifest_counter = 0u64;
         let mut rewritten_count = 0u32;
         let mut added_count = 0u32;
-        let mut new_merged_manifests: Vec<ManifestFile> = Vec::new();
+        let mut merge_groups: Vec<MergedManifestGroup> = Vec::new();
 
         for ((content_type, spec_id), small_manifests) in &groups_to_merge {
             rewritten_count += small_manifests.len() as u32;
 
-            // Look up the partition spec for this group
             let partition_spec = metadata
                 .partition_spec_by_id(*spec_id)
                 .ok_or_else(|| {
@@ -180,175 +172,36 @@ impl<'a> RewriteManifests<'a> {
                 .max(1) as usize;
             let entries_per_manifest = all_entries.len().div_ceil(target_count);
 
-            // Write output manifests, splitting entries across them
+            // Split entries into groups for the action to write
             for chunk in all_entries.chunks(entries_per_manifest.max(1)) {
-                let manifest_path = format!(
-                    "{}/metadata/{}-m{}.avro",
-                    metadata.location(),
-                    commit_uuid,
-                    manifest_counter
-                );
-                manifest_counter += 1;
-
-                let output_file = file_io.new_output(&manifest_path)?;
-                let builder = ManifestWriterBuilder::new(
-                    output_file,
-                    Some(snapshot_id),
-                    None,
-                    schema.clone(),
-                    partition_spec.clone(),
-                );
-
-                let mut writer = match metadata.format_version() {
-                    FormatVersion::V1 => builder.build_v1(),
-                    FormatVersion::V2 => match content_type {
-                        ManifestContentType::Data => builder.build_v2_data(),
-                        ManifestContentType::Deletes => builder.build_v2_deletes(),
-                    },
-                    FormatVersion::V3 => match content_type {
-                        ManifestContentType::Data => builder.build_v3_data(),
-                        ManifestContentType::Deletes => builder.build_v3_deletes(),
-                    },
-                };
-
-                for entry in chunk {
-                    let entry_snapshot_id = entry.snapshot_id().ok_or_else(|| {
-                        Error::new(ErrorKind::DataInvalid, "Manifest entry missing snapshot_id")
-                    })?;
-                    let sequence_number = entry.sequence_number().unwrap_or(0);
-                    let file_sequence_number = entry.file_sequence_number;
-                    writer.add_existing_file(
-                        entry.data_file().clone(),
-                        entry_snapshot_id,
-                        sequence_number,
-                        file_sequence_number,
-                    )?;
-                }
-
-                let merged_manifest = writer.write_manifest_file().await?;
-                new_merged_manifests.push(merged_manifest);
+                merge_groups.push(MergedManifestGroup {
+                    entries: chunk.to_vec(),
+                    content_type: *content_type,
+                    partition_spec: partition_spec.clone(),
+                });
                 added_count += 1;
             }
         }
 
-        // Build the final manifest list: kept manifests + new merged manifests
-        let mut final_manifests = kept_manifests;
-        final_manifests.extend(new_merged_manifests);
-
-        // Write the new manifest list
-        let next_seq_num = metadata.next_sequence_number();
-        let manifest_list_path = format!(
-            "{}/metadata/snap-{}-0-{}.avro",
-            metadata.location(),
-            snapshot_id,
-            commit_uuid
-        );
-        let manifest_list_output = file_io.new_output(&manifest_list_path)?;
-
-        let mut manifest_list_writer = match metadata.format_version() {
-            FormatVersion::V1 => ManifestListWriter::v1(
-                manifest_list_output,
-                snapshot_id,
-                metadata.current_snapshot_id(),
-            ),
-            FormatVersion::V2 => ManifestListWriter::v2(
-                manifest_list_output,
-                snapshot_id,
-                metadata.current_snapshot_id(),
-                next_seq_num,
-            ),
-            FormatVersion::V3 => {
-                let first_row_id = Some(metadata.next_row_id());
-                ManifestListWriter::v3(
-                    manifest_list_output,
-                    snapshot_id,
-                    metadata.current_snapshot_id(),
-                    next_seq_num,
-                    first_row_id,
-                )
-            }
-        };
-
-        manifest_list_writer.add_manifests(final_manifests.into_iter())?;
-        manifest_list_writer.close().await?;
-
-        // Build the new snapshot — inherit summary from parent since no data
-        // files changed.
-        let commit_ts = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let summary = Summary {
-            operation: Operation::Replace,
-            additional_properties: Default::default(),
-        };
-
-        let new_snapshot = Snapshot::builder()
-            .with_manifest_list(manifest_list_path)
-            .with_snapshot_id(snapshot_id)
-            .with_parent_snapshot_id(metadata.current_snapshot_id())
-            .with_sequence_number(next_seq_num)
-            .with_summary(summary)
-            .with_schema_id(metadata.current_schema_id())
-            .with_timestamp_ms(commit_ts)
-            .build();
-
-        // Commit via catalog
-        // TODO: Migrate to shared snapshot-production commit path
-        // (RewriteManifestsAction / SnapshotProducer) once the producer
-        // supports pre-written manifests with correct snapshot_id assignment.
-        let table_commit = TableCommit::builder()
-            .ident(self.table.identifier().clone())
-            .updates(vec![
-                TableUpdate::AddSnapshot {
-                    snapshot: new_snapshot,
-                },
-                TableUpdate::SetSnapshotRef {
-                    ref_name: MAIN_BRANCH.to_string(),
-                    reference: SnapshotReference::new(
-                        snapshot_id,
-                        SnapshotRetention::branch(None, None, None),
-                    ),
-                },
-            ])
-            .requirements(vec![
-                TableRequirement::UuidMatch {
-                    uuid: metadata.uuid(),
-                },
-                TableRequirement::RefSnapshotIdMatch {
-                    r#ref: MAIN_BRANCH.to_string(),
-                    snapshot_id: metadata.current_snapshot_id(),
-                },
-            ])
-            .build();
-
-        self.catalog.update_table(table_commit).await?;
+        // Commit via Transaction + RewriteManifestsAction. The action writes
+        // merged manifests inside SnapshotProducer where the snapshot_id is
+        // known, ensuring correct manifest metadata.
+        let tx = Transaction::new(self.table);
+        let mut action = tx.rewrite_manifests().with_kept_manifests(kept_manifests);
+        for group in merge_groups {
+            action = action.add_merge_group(group);
+        }
+        let tx = action.apply(tx).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to apply rewrite manifests action: {e}"),
+            )
+        })?;
+        tx.commit(self.catalog).await?;
 
         Ok(RewriteManifestsResult {
             rewritten_manifests_count: rewritten_count,
             added_manifests_count: added_count,
         })
     }
-}
-
-/// Generate a unique snapshot ID that does not collide with existing snapshots.
-fn generate_unique_snapshot_id(table: &Table) -> i64 {
-    let generate_random_id = || -> i64 {
-        let (lhs, rhs) = Uuid::new_v4().as_u64_pair();
-        let snapshot_id = (lhs ^ rhs) as i64;
-        if snapshot_id < 0 {
-            -snapshot_id
-        } else {
-            snapshot_id
-        }
-    };
-    let mut snapshot_id = generate_random_id();
-    while table
-        .metadata()
-        .snapshots()
-        .any(|s| s.snapshot_id() == snapshot_id)
-    {
-        snapshot_id = generate_random_id();
-    }
-    snapshot_id
 }

@@ -138,6 +138,16 @@ impl<'a> SnapshotProducer<'a> {
         }
     }
 
+    /// Returns the snapshot ID that will be used for the new snapshot.
+    pub(crate) fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+
+    /// Returns the commit UUID for this snapshot operation.
+    pub(crate) fn commit_uuid(&self) -> Uuid {
+        self.commit_uuid
+    }
+
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
         for data_file in &self.added_data_files {
             if data_file.content_type() != crate::spec::DataContentType::Data {

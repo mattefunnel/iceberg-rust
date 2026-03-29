@@ -22,7 +22,10 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::spec::{ManifestEntry, ManifestFile, Operation};
+use crate::spec::{
+    DataFileFormat, FormatVersion, ManifestContentType, ManifestEntry, ManifestEntryRef,
+    ManifestFile, ManifestWriterBuilder, Operation, PartitionSpec,
+};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
@@ -30,30 +33,49 @@ use crate::transaction::snapshot::{
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind};
 
+/// A group of manifest entries to be written as a new merged manifest.
+#[derive(Debug, Clone)]
+pub struct MergedManifestGroup {
+    /// The entries to write.
+    pub entries: Vec<ManifestEntryRef>,
+    /// The content type for the output manifest.
+    pub content_type: ManifestContentType,
+    /// The partition spec for the output manifest.
+    pub partition_spec: PartitionSpec,
+}
+
 /// `RewriteManifestsAction` is a transaction action that replaces a set of
-/// manifest files with a new set, without changing any data files. This is
-/// used by manifest compaction to merge small manifests into larger ones.
+/// manifest files with new merged manifests, without changing any data files.
 ///
-/// The action produces a `Replace` snapshot through `SnapshotProducer`,
-/// ensuring correct summary computation and sequence numbering.
+/// Unlike pre-writing manifests before commit, this action writes merged
+/// manifests inside the `SnapshotProduceOperation` where the snapshot ID is
+/// known, ensuring correct metadata on the output manifest files.
 pub struct RewriteManifestsAction {
-    /// The final manifest list: kept (unmodified) manifests plus new merged
-    /// manifests, minus the old manifests that were rewritten.
-    new_manifest_list: Vec<ManifestFile>,
+    /// Manifests that are kept unchanged (not rewritten).
+    kept_manifests: Vec<ManifestFile>,
+    /// Groups of entries to be written as new merged manifests.
+    merge_groups: Vec<MergedManifestGroup>,
     snapshot_properties: HashMap<String, String>,
 }
 
 impl RewriteManifestsAction {
     pub(crate) fn new() -> Self {
         Self {
-            new_manifest_list: Vec::new(),
+            kept_manifests: Vec::new(),
+            merge_groups: Vec::new(),
             snapshot_properties: HashMap::new(),
         }
     }
 
-    /// Set the complete new manifest list (kept manifests + merged manifests).
-    pub fn with_manifest_list(mut self, manifests: Vec<ManifestFile>) -> Self {
-        self.new_manifest_list = manifests;
+    /// Set the manifests that should be kept unchanged.
+    pub fn with_kept_manifests(mut self, manifests: Vec<ManifestFile>) -> Self {
+        self.kept_manifests = manifests;
+        self
+    }
+
+    /// Add a group of entries to be written as a merged manifest.
+    pub fn add_merge_group(mut self, group: MergedManifestGroup) -> Self {
+        self.merge_groups.push(group);
         self
     }
 }
@@ -61,16 +83,14 @@ impl RewriteManifestsAction {
 #[async_trait]
 impl TransactionAction for RewriteManifestsAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        if self.new_manifest_list.is_empty() {
+        if self.kept_manifests.is_empty() && self.merge_groups.is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
-                "Rewrite manifests action requires a non-empty manifest list",
+                "Rewrite manifests action requires at least one manifest",
             ));
         }
 
-        // Pass a snapshot property to satisfy SnapshotProducer's precondition
-        // that either added_data_files or snapshot_properties is non-empty.
-        // Manifest rewrites don't add data files.
+        // Pass a snapshot property to satisfy SnapshotProducer's precondition.
         let mut props = self.snapshot_properties.clone();
         props
             .entry("iceberg.action".to_string())
@@ -81,11 +101,12 @@ impl TransactionAction for RewriteManifestsAction {
             Uuid::now_v7(),
             None,
             props,
-            vec![], // No added data files — manifest rewrite only
+            vec![], // No added data files
         );
 
         let operation = RewriteManifestsOperation {
-            new_manifest_list: self.new_manifest_list.clone(),
+            kept_manifests: self.kept_manifests.clone(),
+            merge_groups: self.merge_groups.clone(),
         };
 
         snapshot_producer
@@ -95,7 +116,8 @@ impl TransactionAction for RewriteManifestsAction {
 }
 
 struct RewriteManifestsOperation {
-    new_manifest_list: Vec<ManifestFile>,
+    kept_manifests: Vec<ManifestFile>,
+    merge_groups: Vec<MergedManifestGroup>,
 }
 
 impl SnapshotProduceOperation for RewriteManifestsOperation {
@@ -107,15 +129,75 @@ impl SnapshotProduceOperation for RewriteManifestsOperation {
         &self,
         _snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestEntry>> {
-        // No data files are being changed in a manifest rewrite
         Ok(vec![])
     }
 
     async fn existing_manifest(
         &self,
-        _snapshot_produce: &SnapshotProducer<'_>,
+        snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        // Return the pre-computed manifest list (kept + merged manifests)
-        Ok(self.new_manifest_list.clone())
+        let mut result = self.kept_manifests.clone();
+
+        // Write each merge group as a new manifest, using the producer's
+        // snapshot_id so the manifest metadata is correct.
+        let snapshot_id = snapshot_produce.snapshot_id();
+        let commit_uuid = snapshot_produce.commit_uuid();
+        let table = snapshot_produce.table;
+        let metadata = table.metadata();
+        let schema = metadata.current_schema().clone();
+        let file_io = table.file_io();
+
+        for (idx, group) in self.merge_groups.iter().enumerate() {
+            if group.entries.is_empty() {
+                continue;
+            }
+
+            let manifest_path = format!(
+                "{}/metadata/{}-m{}.{}",
+                metadata.location(),
+                commit_uuid,
+                idx,
+                DataFileFormat::Avro,
+            );
+            let output_file = file_io.new_output(&manifest_path)?;
+            let builder = ManifestWriterBuilder::new(
+                output_file,
+                Some(snapshot_id),
+                None,
+                schema.clone(),
+                group.partition_spec.clone(),
+            );
+
+            let mut writer = match metadata.format_version() {
+                FormatVersion::V1 => builder.build_v1(),
+                FormatVersion::V2 => match group.content_type {
+                    ManifestContentType::Data => builder.build_v2_data(),
+                    ManifestContentType::Deletes => builder.build_v2_deletes(),
+                },
+                FormatVersion::V3 => match group.content_type {
+                    ManifestContentType::Data => builder.build_v3_data(),
+                    ManifestContentType::Deletes => builder.build_v3_deletes(),
+                },
+            };
+
+            for entry in &group.entries {
+                let entry_snapshot_id = entry.snapshot_id().ok_or_else(|| {
+                    Error::new(ErrorKind::DataInvalid, "Manifest entry missing snapshot_id")
+                })?;
+                let sequence_number = entry.sequence_number().unwrap_or(0);
+                let file_sequence_number = entry.file_sequence_number;
+                writer.add_existing_file(
+                    entry.data_file().clone(),
+                    entry_snapshot_id,
+                    sequence_number,
+                    file_sequence_number,
+                )?;
+            }
+
+            let manifest_file = writer.write_manifest_file().await?;
+            result.push(manifest_file);
+        }
+
+        Ok(result)
     }
 }

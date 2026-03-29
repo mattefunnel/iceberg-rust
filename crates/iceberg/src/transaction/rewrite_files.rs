@@ -244,6 +244,13 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         // that no new delete files have been added for partitions containing
         // files being rewritten. This mirrors Java's
         // `validateNoNewDeletesForDataFiles()` in MergingSnapshotProducer.
+        //
+        // NOTE: This check is partition-level, not file-level. A new delete
+        // targeting an unrelated data file in the SAME partition will still
+        // trigger a conflict. This is conservatively correct (never misses a
+        // real conflict) but may produce false positives in busy partitions.
+        // File-level matching would require reading delete file contents to
+        // determine which data files they target.
         if let Some(data_seq_num) = self.data_sequence_number {
             let rewrite_partitions: HashSet<&Struct> =
                 self.files_to_delete.iter().map(|f| f.partition()).collect();
@@ -318,13 +325,30 @@ mod tests {
     use crate::transaction::{ApplyTransactionAction, Transaction};
 
     fn make_data_file(path: &str, record_count: u64) -> DataFile {
+        make_data_file_in_partition(path, record_count, 0)
+    }
+
+    fn make_data_file_in_partition(path: &str, record_count: u64, partition_val: i64) -> DataFile {
         DataFileBuilder::default()
             .content(DataContentType::Data)
             .file_path(path.to_string())
             .file_format(DataFileFormat::Parquet)
             .file_size_in_bytes(100)
             .record_count(record_count)
-            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .partition(Struct::from_iter([Some(Literal::long(partition_val))]))
+            .partition_spec_id(0)
+            .build()
+            .unwrap()
+    }
+
+    fn make_delete_file_in_partition(path: &str, partition_val: i64) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(50)
+            .record_count(1)
+            .partition(Struct::from_iter([Some(Literal::long(partition_val))]))
             .partition_spec_id(0)
             .build()
             .unwrap()
@@ -421,4 +445,60 @@ mod tests {
             err.message()
         );
     }
+
+    /// Verify that a rewrite succeeds with validate_from_snapshot when
+    /// concurrent appends have occurred (but no conflicting deletes).
+    #[tokio::test]
+    async fn test_rewrite_files_succeeds_with_concurrent_append() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // Append a data file — this is the file we'll rewrite.
+        let file_p0 = make_data_file_in_partition("test/p0-data.parquet", 10, 0);
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![file_p0.clone()]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let planning_snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
+        let planning_seq_num = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .sequence_number();
+
+        // Concurrent append in a different partition — not a conflict.
+        let file_p1 = make_data_file_in_partition("test/p1-data.parquet", 10, 1);
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![file_p1]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // Rewrite file_p0 with validation against the planning snapshot.
+        let replacement = make_data_file_in_partition("test/p0-compacted.parquet", 10, 0);
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_files(vec![file_p0])
+            .add_files(vec![replacement])
+            .validate_from_snapshot(planning_snapshot_id)
+            .data_sequence_number(planning_seq_num);
+        let tx = action.apply(tx).unwrap();
+
+        // Should succeed — planning snapshot is an ancestor and no DELETE
+        // manifests were added.
+        let result = tx.commit(&catalog).await;
+        assert!(
+            result.is_ok(),
+            "Rewrite should succeed with concurrent append, got: {:?}",
+            result.err()
+        );
+    }
+
+    // NOTE: Testing concurrent-delete validation with DELETE manifests
+    // requires a RowDelta action (to create DELETE manifests with position
+    // delete files), which is not yet available in iceberg-rust. The
+    // partition-level conflict check in delete_entries() is exercised
+    // once RowDelta is implemented. See the plan document for the planned
+    // test: test_rewrite_files_ignores_deletes_on_unrelated_files.
 }

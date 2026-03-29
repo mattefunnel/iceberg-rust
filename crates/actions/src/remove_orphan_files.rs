@@ -90,8 +90,9 @@ impl<'a> RemoveOrphanFiles<'a> {
     }
 
     /// Set the timestamp threshold. Files modified after this time are
-    /// excluded from orphan detection. Files without available modification
-    /// time are conservatively retained (not treated as orphans).
+    /// excluded from orphan detection. When modification time is not
+    /// available from the storage backend, the file is still treated as
+    /// an orphan candidate (the guard only applies when mtime is known).
     pub fn older_than(mut self, older_than: SystemTime) -> Self {
         self.older_than = older_than;
         self
