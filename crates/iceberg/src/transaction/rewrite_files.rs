@@ -241,17 +241,19 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         }
 
         // Concurrent-delete validation: if data_sequence_number is set, check
-        // that no new delete files have been added for partitions containing
-        // files being rewritten. This mirrors Java's
-        // `validateNoNewDeletesForDataFiles()` in MergingSnapshotProducer.
+        // that no new delete files have been added targeting the data files
+        // being rewritten. Mirrors Java's `validateNoNewDeletesForDataFiles()`
+        // in MergingSnapshotProducer.
         //
-        // NOTE: This check is partition-level, not file-level. A new delete
-        // targeting an unrelated data file in the SAME partition will still
-        // trigger a conflict. This is conservatively correct (never misses a
-        // real conflict) but may produce false positives in busy partitions.
-        // File-level matching would require reading delete file contents to
-        // determine which data files they target.
+        // When a delete file has `referenced_data_file` set (position deletes
+        // referencing a single file, and all DVs), we do file-level matching:
+        // only conflict if the referenced file is one we're rewriting. When the
+        // field is not set (classic broad position deletes, equality deletes),
+        // we fall back to partition-level matching, which is conservatively
+        // correct but may produce false positives in busy partitions.
         if let Some(data_seq_num) = self.data_sequence_number {
+            let rewrite_paths: HashSet<&str> =
+                self.files_to_delete.iter().map(|f| f.file_path()).collect();
             let rewrite_partitions: HashSet<&Struct> =
                 self.files_to_delete.iter().map(|f| f.partition()).collect();
 
@@ -266,10 +268,24 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
 
                 for entry in manifest.entries() {
                     let entry_seq = entry.sequence_number().unwrap_or(0);
-                    if entry_seq > data_seq_num
-                        && entry.is_alive()
-                        && rewrite_partitions.contains(entry.data_file().partition())
+                    if entry_seq <= data_seq_num || !entry.is_alive() {
+                        continue;
+                    }
+
+                    // File-level check: if the delete references a specific
+                    // data file, only conflict if that file is being rewritten.
+                    let conflicts = if let Some(ref referenced) =
+                        entry.data_file().referenced_data_file
                     {
+                        rewrite_paths.contains(referenced.as_str())
+                    } else {
+                        // Partition-level fallback for deletes without a
+                        // referenced_data_file (classic position deletes
+                        // spanning multiple files, equality deletes).
+                        rewrite_partitions.contains(entry.data_file().partition())
+                    };
+
+                    if conflicts {
                         return Err(Error::new(
                             ErrorKind::DataInvalid,
                             format!(
