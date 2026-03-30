@@ -15,18 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod actions;
+//! Smoke test for the shared test context.
 
-mod catalog;
-pub use catalog::*;
+mod common;
 
-mod error;
-pub use error::*;
+use common::TestContext;
 
-pub mod physical_plan;
-mod schema;
-pub mod table;
-pub use table::table_provider_factory::IcebergTableProviderFactory;
-pub use table::*;
+#[tokio::test]
+async fn test_context_creates_table_and_appends() {
+    let ctx = TestContext::new("smoke").await;
 
-pub(crate) mod task_writer;
+    // Table should exist and have no snapshots initially
+    let table = ctx.load_table().await;
+    assert!(table.metadata().current_snapshot().is_none());
+
+    // Append one data file; should create a snapshot
+    ctx.append_data_file().await;
+    let table = ctx.load_table().await;
+    assert!(table.metadata().current_snapshot().is_some());
+
+    // Append more data files in a second snapshot
+    ctx.append_data_files(3).await;
+    let table = ctx.load_table().await;
+    assert_eq!(table.metadata().snapshots().count(), 2);
+}

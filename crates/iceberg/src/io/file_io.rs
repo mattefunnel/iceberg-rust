@@ -17,14 +17,30 @@
 
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
+use std::time::SystemTime;
 
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 
 use super::storage::{
     LocalFsStorageFactory, MemoryStorageFactory, Storage, StorageConfig, StorageFactory,
 };
 use crate::Result;
+
+/// A file entry returned by [`FileIO::list_with_metadata`], carrying optional
+/// metadata alongside the file path. Storage backends that return metadata
+/// from list operations populate `last_modified` and `size`; others return
+/// `None`.
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    /// Absolute file path.
+    pub path: String,
+    /// Last modification time, if available from the storage backend.
+    pub last_modified: Option<SystemTime>,
+    /// File size in bytes, if available from the storage backend.
+    pub size: Option<u64>,
+}
 
 /// FileIO implementation, used to manipulate files in underlying storage.
 ///
@@ -179,6 +195,56 @@ impl FileIO {
     pub fn new_output(&self, path: impl AsRef<str>) -> Result<OutputFile> {
         self.get_storage()?.new_output(path.as_ref())
     }
+
+    /// List all files under the given prefix.
+    ///
+    /// Returns a stream of absolute file paths that start with the given prefix.
+    ///
+    /// # Arguments
+    ///
+    /// * prefix: It should be an *absolute* path starting with the scheme string used to construct [`FileIO`].
+    pub async fn list(
+        &self,
+        prefix: impl AsRef<str>,
+    ) -> Result<BoxStream<'static, Result<String>>> {
+        self.get_storage()?.list(prefix.as_ref()).await
+    }
+
+    /// List all files under the given prefix, returning metadata when available.
+    ///
+    /// Returns a stream of [`FileEntry`] objects containing the file path and
+    /// optional metadata (modification time, size). Storage backends that
+    /// support returning metadata from list operations (e.g., S3 ListObjectsV2)
+    /// will populate these fields. Others return `None`.
+    ///
+    /// This method currently wraps [`FileIO::list()`] and returns `None` for
+    /// metadata fields. Storage-specific optimizations can be added later.
+    pub async fn list_with_metadata(
+        &self,
+        prefix: impl AsRef<str>,
+    ) -> Result<BoxStream<'static, Result<FileEntry>>> {
+        let storage = self.get_storage()?.clone();
+        let stream = storage.list(prefix.as_ref()).await?;
+        let storage_for_metadata = storage;
+        Ok(Box::pin(stream.then(move |result| {
+            let storage = storage_for_metadata.clone();
+            async move {
+                let path = result?;
+                // Attempt to get metadata (including mtime) for each file.
+                // If metadata retrieval fails, return the entry without mtime
+                // rather than failing the entire listing.
+                let (last_modified, size) = match storage.metadata(&path).await {
+                    Ok(meta) => (meta.last_modified, Some(meta.size)),
+                    Err(_) => (None, None),
+                };
+                Ok(FileEntry {
+                    path,
+                    last_modified,
+                    size,
+                })
+            }
+        })))
+    }
 }
 
 /// Builder for [`FileIO`].
@@ -240,6 +306,8 @@ impl FileIOBuilder {
 pub struct FileMetadata {
     /// The size of the file.
     pub size: u64,
+    /// Last modification time of the file, if available from the storage backend.
+    pub last_modified: Option<SystemTime>,
 }
 
 /// Trait for reading file.
@@ -536,5 +604,41 @@ mod tests {
 
         assert_eq!(file_io.config().get("key1"), Some(&"value1".to_string()));
         assert_eq!(file_io.config().get("key2"), Some(&"value2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_file_io_list() {
+        use futures::TryStreamExt;
+
+        let file_io = FileIO::new_with_memory();
+        file_io
+            .new_output("memory:///a/b/file1.parquet")
+            .unwrap()
+            .write(Bytes::from("x"))
+            .await
+            .unwrap();
+        file_io
+            .new_output("memory:///a/b/file2.parquet")
+            .unwrap()
+            .write(Bytes::from("x"))
+            .await
+            .unwrap();
+        file_io
+            .new_output("memory:///a/c/file3.parquet")
+            .unwrap()
+            .write(Bytes::from("x"))
+            .await
+            .unwrap();
+
+        let mut listed: Vec<String> = file_io
+            .list("memory:///a/b/")
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        listed.sort();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|p| p.starts_with("memory:///a/b/")));
     }
 }

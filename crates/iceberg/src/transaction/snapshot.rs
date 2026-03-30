@@ -67,7 +67,6 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     fn operation(&self) -> Operation;
 
     /// Returns manifest entries that should be marked as deleted in the new snapshot.
-    #[allow(unused)]
     fn delete_entries(
         &self,
         snapshot_produce: &SnapshotProducer,
@@ -137,6 +136,16 @@ impl<'a> SnapshotProducer<'a> {
             added_data_files,
             manifest_counter: (0..),
         }
+    }
+
+    /// Returns the snapshot ID that will be used for the new snapshot.
+    pub(crate) fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+
+    /// Returns the commit UUID for this snapshot operation.
+    pub(crate) fn commit_uuid(&self) -> Uuid {
+        self.commit_uuid
     }
 
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
@@ -319,6 +328,18 @@ impl<'a> SnapshotProducer<'a> {
         writer.write_manifest_file().await
     }
 
+    // Write manifest file for deleted data files and return the ManifestFile for ManifestList.
+    async fn write_delete_manifest(
+        &mut self,
+        delete_entries: Vec<ManifestEntry>,
+    ) -> Result<ManifestFile> {
+        let mut writer = self.new_manifest_writer(ManifestContentType::Data)?;
+        for entry in delete_entries {
+            writer.add_delete_entry(entry)?;
+        }
+        writer.write_manifest_file().await
+    }
+
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
         &mut self,
         snapshot_produce_operation: &OP,
@@ -345,8 +366,12 @@ impl<'a> SnapshotProducer<'a> {
             manifest_files.push(added_manifest);
         }
 
-        // # TODO
-        // Support process delete entries.
+        // Process delete entries.
+        let delete_entries = snapshot_produce_operation.delete_entries(self).await?;
+        if !delete_entries.is_empty() {
+            let delete_manifest = self.write_delete_manifest(delete_entries).await?;
+            manifest_files.push(delete_manifest);
+        }
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
         Ok(manifest_files)
@@ -383,10 +408,11 @@ impl<'a> SnapshotProducer<'a> {
             );
         }
 
-        let previous_snapshot = table_metadata
-            .snapshot_by_id(self.snapshot_id)
-            .and_then(|snapshot| snapshot.parent_snapshot_id())
-            .and_then(|parent_id| table_metadata.snapshot_by_id(parent_id));
+        // Use the current snapshot as the parent for summary inheritance.
+        // The previous code incorrectly looked up self.snapshot_id (the new
+        // snapshot being created, which doesn't exist in metadata yet) instead
+        // of the current snapshot whose totals should be inherited.
+        let previous_snapshot = table_metadata.current_snapshot();
 
         let mut additional_properties = summary_collector.build();
         additional_properties.extend(self.snapshot_properties.clone());

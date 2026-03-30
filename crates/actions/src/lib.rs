@@ -15,18 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod actions;
+//! Table maintenance actions for Apache Iceberg.
+//!
+//! Mirrors the Java `org.apache.iceberg.actions` API layer.
 
-mod catalog;
-pub use catalog::*;
+pub mod expire_snapshots;
+pub mod remove_orphan_files;
+pub mod rewrite_data_files;
+pub mod rewrite_manifests;
 
-mod error;
-pub use error::*;
-
-pub mod physical_plan;
-mod schema;
-pub mod table;
-pub use table::table_provider_factory::IcebergTableProviderFactory;
-pub use table::*;
-
-pub(crate) mod task_writer;
+pub use expire_snapshots::{ExpireSnapshots, ExpireSnapshotsResult};
+pub use remove_orphan_files::{PrefixMismatchMode, RemoveOrphanFiles, RemoveOrphanFilesResult};
+pub use rewrite_data_files::{
+    FileRewriter, RewriteDataFiles, RewriteDataFilesResult, RewriteFileGroup,
+};
+pub use rewrite_manifests::{RewriteManifests, RewriteManifestsResult};

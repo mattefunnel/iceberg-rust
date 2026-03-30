@@ -16,31 +16,20 @@
 # under the License.
 
 [package]
-edition = { workspace = true }
-homepage = { workspace = true }
-name = "iceberg-datafusion"
-rust-version = { workspace = true }
-version = { workspace = true }
-
-categories = ["database"]
-description = "Apache Iceberg DataFusion Integration"
-keywords = ["iceberg", "integrations", "datafusion"]
-license = { workspace = true }
-repository = { workspace = true }
+name = "iceberg-actions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
-anyhow = { workspace = true }
-async-trait = { workspace = true }
-dashmap = { workspace = true }
-datafusion = { workspace = true }
-futures = { workspace = true }
 iceberg = { workspace = true }
-iceberg-actions = { workspace = true }
-parquet = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-expect-test = { workspace = true }
-parquet = { workspace = true }
-tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+bytes = { workspace = true }
+iceberg-catalog-rest = { workspace = true }

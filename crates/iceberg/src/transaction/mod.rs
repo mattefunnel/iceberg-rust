@@ -54,6 +54,8 @@ mod action;
 
 pub use action::*;
 mod append;
+mod rewrite_files;
+mod rewrite_manifests_action;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -65,6 +67,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
+pub use rewrite_files::RewriteFilesAction;
+pub use rewrite_manifests_action::{MergedManifestGroup, RewriteManifestsAction};
 
 use crate::error::Result;
 use crate::spec::TableProperties;
@@ -154,6 +158,17 @@ impl Transaction {
     /// Update the statistics of table
     pub fn update_statistics(&self) -> UpdateStatisticsAction {
         UpdateStatisticsAction::new()
+    }
+
+    /// Creates a rewrite files action for atomically replacing data files.
+    pub fn rewrite_files(&self) -> RewriteFilesAction {
+        RewriteFilesAction::new()
+    }
+
+    /// Creates a rewrite manifests action for replacing manifest files without
+    /// changing data files.
+    pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
+        RewriteManifestsAction::new()
     }
 
     /// Commit transaction.
