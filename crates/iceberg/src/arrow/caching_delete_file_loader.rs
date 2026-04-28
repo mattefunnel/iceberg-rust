@@ -242,11 +242,11 @@ impl CachingDeleteFileLoader {
             DataContentType::PositionDeletes => {
                 match del_filter.try_start_pos_del_load(&task.file_path) {
                     PosDelLoadAction::AlreadyLoaded => Ok(DeleteFileContext::ExistingPosDel),
-                    PosDelLoadAction::WaitFor(notify) => {
+                    PosDelLoadAction::WaitFor => {
                         // Positional deletes are accessed synchronously by ArrowReader.
                         // We must wait here to ensure the data is ready before returning,
                         // otherwise ArrowReader might get an empty/partial result.
-                        notify.notified().await;
+                        del_filter.wait_for_pos_del_load(&task.file_path).await;
                         Ok(DeleteFileContext::ExistingPosDel)
                     }
                     PosDelLoadAction::Load => Ok(DeleteFileContext::PosDels {

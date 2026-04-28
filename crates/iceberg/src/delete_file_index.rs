@@ -97,7 +97,21 @@ impl DeleteFileIndex {
             }
         };
 
-        notifier.notified().await;
+        // Subscribe to the notifier *before* re-reading state. notify_waiters()
+        // only wakes already-subscribed tasks and stores no permit, so a naive
+        // observe-then-await loses the wakeup if the publisher races between
+        // our observation and our subscription.
+        let notified = notifier.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        // Re-check: the publisher may have transitioned (and notified) between
+        // our first read and our subscription. If so, return without awaiting.
+        if let DeleteFileIndexState::Populated(ref index) = *self.state.read().unwrap() {
+            return index.get_deletes_for_data_file(data_file, seq_num);
+        }
+
+        notified.await;
 
         let guard = self.state.read().unwrap();
         match guard.deref() {
@@ -480,5 +494,58 @@ mod tests {
             .sequence_number(data_seq_number)
             .data_file(file.clone())
             .build()
+    }
+
+    /// Coverage for the `Populating → Populated` wait path in
+    /// [`DeleteFileIndex::get_deletes_for_data_file`], guarding against
+    /// regressions in a `Notify::notify_waiters` lost-wakeup pattern.
+    ///
+    /// The pre-fix code clones the notifier under the read lock, drops
+    /// the lock, then calls `notifier.notified().await`. If the
+    /// publisher transitions to `Populated` and calls `notify_waiters()`
+    /// in the gap between the lock release and the subscription, the
+    /// wakeup is lost (`notify_waiters` stores no permit) and the
+    /// reader hangs forever. The fix subscribes via `Notified::enable`
+    /// before re-reading state, so any subsequent notify is guaranteed
+    /// to wake the reader.
+    ///
+    /// Note: this test is not a deterministic regression. The race
+    /// window is only a few CPU cycles wide, with no async yield point
+    /// between observe and subscribe in production code, so on a fast
+    /// machine the bug rarely surfaces in an isolated unit test. The
+    /// race is reliably reproducible at scale via the
+    /// `iceberg-rust-compactor` `fuzz_parquet_file_rewriter` harness,
+    /// which hits it within seconds because each reader path crosses
+    /// many `.await` points (parquet I/O etc.) before reaching the
+    /// notify wait — those yield points let the OS schedule the
+    /// publisher to land in the gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn get_deletes_for_data_file_wait_path() {
+        use std::time::Duration;
+
+        for _ in 0..50 {
+            let (idx, tx) = DeleteFileIndex::new();
+            let data_file = build_unpartitioned_data_file();
+
+            let mut handles = Vec::with_capacity(64);
+            for _ in 0..64 {
+                let idx = idx.clone();
+                let data_file = data_file.clone();
+                handles.push(tokio::spawn(async move {
+                    idx.get_deletes_for_data_file(&data_file, None).await
+                }));
+            }
+
+            tokio::task::yield_now().await;
+            drop(tx); // empty stream → publisher transitions → notify_waiters
+
+            for handle in handles {
+                let result = tokio::time::timeout(Duration::from_secs(5), handle)
+                    .await
+                    .expect("reader timed out — possible lost wakeup")
+                    .unwrap();
+                assert!(result.is_empty());
+            }
+        }
     }
 }

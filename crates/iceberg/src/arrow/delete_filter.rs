@@ -66,10 +66,10 @@ pub(crate) enum PosDelLoadAction {
     Load,
     /// The file is already loaded, nothing to do.
     AlreadyLoaded,
-    /// The file is currently being loaded by another task.
-    /// The caller *must* wait for this notifier to ensure data availability
-    /// before returning, as subsequent access (get_delete_vector) is synchronous.
-    WaitFor(Arc<Notify>),
+    /// The file is currently being loaded by another task. The caller *must*
+    /// wait via [`DeleteFilter::wait_for_pos_del_load`] before returning, since
+    /// subsequent access (get_delete_vector) is synchronous.
+    WaitFor,
 }
 
 impl DeleteFilter {
@@ -127,7 +127,7 @@ impl DeleteFilter {
         if let Some(state) = state.positional_deletes.get(file_path) {
             match state {
                 PosDelState::Loaded => return PosDelLoadAction::AlreadyLoaded,
-                PosDelState::Loading(notify) => return PosDelLoadAction::WaitFor(notify.clone()),
+                PosDelState::Loading(_) => return PosDelLoadAction::WaitFor,
             }
         }
 
@@ -137,6 +137,33 @@ impl DeleteFilter {
             .insert(file_path.to_string(), PosDelState::Loading(notifier));
 
         PosDelLoadAction::Load
+    }
+
+    /// Waits until the positional delete file at `file_path` is fully loaded.
+    ///
+    /// Uses the subscribe-before-recheck pattern so the wait cannot lose the
+    /// wakeup if the publisher transitions to `Loaded` and calls
+    /// `notify_waiters` between our observation and our subscription.
+    pub(crate) async fn wait_for_pos_del_load(&self, file_path: &str) {
+        let notifier = {
+            match self.state.read().unwrap().positional_deletes.get(file_path) {
+                Some(PosDelState::Loaded) => return,
+                Some(PosDelState::Loading(n)) => n.clone(),
+                None => unreachable!("wait_for_pos_del_load called before try_start_pos_del_load"),
+            }
+        };
+
+        let notified = notifier.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        if let Some(PosDelState::Loaded) =
+            self.state.read().unwrap().positional_deletes.get(file_path)
+        {
+            return;
+        }
+
+        notified.await;
     }
 
     /// Marks a positional delete file as successfully loaded and notifies any waiting tasks.
@@ -173,7 +200,20 @@ impl DeleteFilter {
             }
         };
 
-        notifier.notified().await;
+        // Subscribe before re-reading state to avoid losing the wakeup if the
+        // publisher transitions to Loaded and calls notify_waiters between
+        // our observation and our subscription. See `tokio::sync::Notify`.
+        let notified = notifier.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        if let Some(EqDelState::Loaded(predicate)) =
+            self.state.read().unwrap().equality_deletes.get(file_path)
+        {
+            return Some(predicate.clone());
+        }
+
+        notified.await;
 
         match self.state.read().unwrap().equality_deletes.get(file_path) {
             Some(EqDelState::Loaded(predicate)) => Some(predicate.clone()),
