@@ -231,6 +231,75 @@ subscription. Real reader paths cross many `.await` points (parquet I/O,
 manifest decoding, etc.) before reaching the notify wait, which is what
 makes the race observable in the wild.
 
+### Deterministic local verification
+
+We also verified the fix with a temporary, local-only test hook in
+`DeleteFileIndex`. The hook was not kept in production code, even behind
+`cfg(test)`, because it adds scheduler-control plumbing solely for proving
+this race.
+
+The hook forced this exact interleaving:
+
+1. reader enters `get_deletes_for_data_file` and observes `Populating`
+2. reader parks before subscribing to `Notify`
+3. test drops the delete-file sender
+4. publisher transitions to `Populated` and calls `notify_waiters`
+5. test releases the reader
+
+With the fixed subscribe-before-recheck implementation, the reader returns
+immediately in step 5 because the re-check observes `Populated`. With the
+old implementation restored (`notifier.notified().await` directly after the
+first state read), the same test fails reliably by timeout:
+
+```text
+reader timed out after notify_waiters ran before subscription: Elapsed(())
+```
+
+This confirms that the current checked-in unit test is only smoke coverage,
+while the underlying race can be made deterministic by adding an explicit
+test-only scheduler gate at the observe/subscribe boundary.
+
+### Manual stress verification
+
+A temporary local stress harness was also used to demonstrate the old bug
+without keeping extra regression-test code in the PR. The harness repeatedly
+created a `DeleteFileIndex`, released 2048 readers at the wait path, dropped
+the delete-file sender, and failed as soon as any reader timed out.
+
+With the pre-fix wait restored locally (`notifier.notified().await` directly
+after the first state read), ten consecutive harness runs all reproduced the
+hang quickly on macOS:
+
+```text
+run  1: failed at iteration 353  after  3.435s
+run  2: failed at iteration 311  after  2.961s
+run  3: failed at iteration 974  after  7.255s
+run  4: failed at iteration 2950 after 19.324s
+run  5: failed at iteration 1210 after  8.664s
+run  6: failed at iteration 543  after  4.428s
+run  7: failed at iteration 2815 after 19.999s
+run  8: failed at iteration 976  after  7.207s
+run  9: failed at iteration 136  after  1.845s
+run 10: failed at iteration 553  after  4.559s
+```
+
+The slowest buggy run failed in roughly 20 seconds. With the fix in place,
+the same stress shape was then run for 200 seconds (10x the slowest failure)
+and completed successfully:
+
+```text
+completed 28937 lost-wakeup stress iterations with 2048 readers each in 200.001s
+```
+
+The same stress harness was also run against latest `upstream/main` at
+`88ca8b6f` (`feat(encryption) [3/N] Support encryption: KMS (#2339)`), which
+still had the direct `notifier.notified().await` wait in
+`DeleteFileIndex::get_deletes_for_data_file`. It reproduced the bug:
+
+```text
+reader timed out - possible lost wakeup (iteration 939, readers 2048, elapsed 6.665s)
+```
+
 ## Root cause
 
 All three sites share the same shape:
