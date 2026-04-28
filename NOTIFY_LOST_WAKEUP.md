@@ -11,6 +11,85 @@ the lock release and the subscription, the wakeup is lost — `notify_waiters`
 only wakes already-subscribed tasks and stores no permit — and the reader
 hangs forever.
 
+## Plain-language explanation
+
+For readers unfamiliar with Rust or tokio, here is the gist.
+
+### The doorbell analogy
+
+`tokio::sync::Notify` is the synchronisation primitive at the heart of this
+bug. Picture it as a doorbell:
+
+- **Waiters** ring up and listen for a ding.
+- A **publisher** can call `notify_waiters()`, which dings the bell *once*
+  for everyone currently listening.
+- Crucially, if `notify_waiters()` runs and nobody is listening yet, the
+  ding is lost forever. The bell stores no note; there is no "I missed it,
+  ring again" semantics. (A different method, `notify_one`, *does* store
+  one permit, but the publishers here use `notify_waiters` because there
+  may be many concurrent readers.)
+
+### Why the old code was wrong
+
+Each affected site followed this shape:
+
+1. Read shared state under a lock. See "still loading". Clone the doorbell.
+2. *Drop the lock.*
+3. Subscribe to the doorbell and sleep until it dings.
+
+Between step 2 and step 3, on a multi-core machine the publisher can finish,
+write the new state, and ring the bell. By the time the consumer reaches
+step 3 the ding has already happened — and `notify_waiters` did not store
+it. The consumer subscribes to a bell that will never ring again and parks
+forever.
+
+### Why the fix works
+
+The new code uses the standard `Notify` race-free dance:
+
+1. Read state. If already done, return immediately.
+2. Create a subscription via `notifier.notified()` — a *lazy* listener that
+   has not yet armed itself.
+3. **Arm** it with `enable()`. From this moment on, any future
+   `notify_waiters()` call is guaranteed to wake this listener.
+4. **Re-check** the state. If the publisher finished between steps 1 and 3,
+   we observe the new state here and return without sleeping.
+5. Otherwise, await — guaranteed to wake.
+
+Every interleaving is now safe (see the *Correctness argument* below).
+
+### Per-file changes
+
+- **`Cargo.toml`** — add `tokio` as a dev-dependency with `macros`,
+  `rt-multi-thread`, and `time` features so the new test can use
+  `#[tokio::test]`, run on a multi-threaded runtime, and call
+  `tokio::time::timeout`.
+- **`arrow/caching_delete_file_loader.rs`** — the caller no longer awaits
+  the raw notifier directly; it delegates to a new
+  `DeleteFilter::wait_for_pos_del_load` helper that performs the
+  subscribe-then-recheck dance under the right lock.
+- **`arrow/delete_filter.rs`** —
+  - `PosDelLoadAction::WaitFor` no longer carries the `Arc<Notify>`; the
+    new helper looks the notifier up itself, so the raw doorbell never
+    leaves the type that owns the state.
+  - New `wait_for_pos_del_load` method implements the race-free pattern.
+  - `wait_for_eq_del_load` is patched in place with the same pattern.
+- **`delete_file_index.rs`** — `get_deletes_for_data_file` is patched in
+  place with the same pattern, and a new multi-threaded stress test
+  `get_deletes_for_data_file_wait_path` exercises the wait path with 64
+  concurrent readers across 50 iterations to amplify the (now-impossible)
+  race.
+
+### tl;dr
+
+Three callers of `tokio::sync::Notify::notified().await` could lose wakeups
+when the producer raced between their state observation and their
+subscription. Each was rewritten to **subscribe (`enable()`) first, then
+re-check state, then await**. A new helper `wait_for_pos_del_load`
+encapsulates the pattern for positional deletes so its caller no longer
+touches the raw notifier, and a multi-threaded stress test guards the
+`DeleteFileIndex` path.
+
 ## Symptoms
 
 The hang shape is consistent and easy to recognise:
