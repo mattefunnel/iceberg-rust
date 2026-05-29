@@ -1069,4 +1069,89 @@ mod tests {
         // confirming that the second load reused the result from the first.
         assert!(Arc::ptr_eq(&dv1, &dv2));
     }
+
+    /// Reproduction of the positional-delete lost-wakeup race via the real
+    /// `load_deletes` path, modelling a **broad positional delete**: one small
+    /// delete file referenced by many data-file tasks.
+    ///
+    /// All tasks share one `CachingDeleteFileLoader` (hence one `DeleteFilter`
+    /// state), so the first `try_start_pos_del_load` wins `Load` and the rest
+    /// get `WaitFor`. The single loader reads the tiny file fast and calls
+    /// `finish_pos_del_load` → `notify_waiters` while hundreds of waiters are
+    /// still trickling through the write-locked `try_start_pos_del_load` and
+    /// have not yet subscribed. Oversubscribed worker threads widen that gap.
+    ///
+    /// Expected RED on the pre-fix `wait_for_pos_del_load`
+    /// (`notifier.notified().await` straight after observing `Loading`): a
+    /// waiter subscribes after the single notify and parks forever, so its
+    /// `load_deletes` future never resolves and the round times out. GREEN on
+    /// the subscribe-before-recheck fix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 100)]
+    async fn broad_positional_delete_reproduces_lost_wakeup() {
+        use crate::arrow::delete_filter::tests::create_pos_del_schema;
+        use crate::spec::Schema;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path();
+        let file_io = FileIO::new_with_fs();
+
+        let pos_del_path = format!(
+            "{}/broad-pos-del.parquet",
+            table_location.to_str().unwrap()
+        );
+        {
+            let pos_del_schema = create_pos_del_schema();
+            let file_path_col = Arc::new(StringArray::from_iter_values(vec![
+                format!("{}/data.parquet", table_location.to_str().unwrap());
+                2
+            ]));
+            let pos_col = Arc::new(Int64Array::from_iter_values(vec![0i64, 1]));
+            let batch =
+                RecordBatch::try_new(pos_del_schema.clone(), vec![file_path_col, pos_col]).unwrap();
+            let file = File::create(&pos_del_path).unwrap();
+            let props = WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build();
+            let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let pos_del = FileScanTaskDeleteFile {
+            file_path: pos_del_path.clone(),
+            file_size_in_bytes: std::fs::metadata(&pos_del_path).unwrap().len(),
+            file_type: DataContentType::PositionDeletes,
+            partition_spec_id: 0,
+            equality_ids: None,
+        };
+        let schema = Arc::new(Schema::builder().build().unwrap());
+
+        const ROUNDS: usize = 200;
+        const WAITERS: usize = 2000;
+
+        for round in 0..ROUNDS {
+            // Fresh loader → fresh DeleteFilter state, so every round races the
+            // `Loading -> Loaded` transition from scratch.
+            let loader = CachingDeleteFileLoader::new(file_io.clone(), 10, Runtime::current());
+            let deletes = vec![pos_del.clone()];
+
+            let mut receivers = Vec::with_capacity(WAITERS);
+            for _ in 0..WAITERS {
+                receivers.push(loader.load_deletes(&deletes, schema.clone()));
+            }
+
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                for rx in receivers {
+                    rx.await.unwrap().unwrap();
+                }
+            })
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "lost wakeup: a positional-delete waiter never woke (round {round}, \
+                 {WAITERS} waiters) — finish_pos_del_load's notify_waiters ran before it subscribed"
+            );
+        }
+    }
 }

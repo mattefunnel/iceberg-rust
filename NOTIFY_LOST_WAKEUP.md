@@ -302,43 +302,66 @@ delete-heavy tables on a multi-core runtime
 a soak — once enough concurrent readers cross delete-loading paths, one of
 them lands in the gap.
 
-The race window in production code is only a few CPU cycles wide, with no
-`.await` between observe and subscribe, so isolated unit-test reproductions
-are unreliable on fast machines: there is no preemption point for the OS to
-schedule the publisher between the reader's lock release and its
-subscription. Real reader paths cross many `.await` points (parquet I/O,
-manifest decoding, etc.) before reaching the notify wait, which is what
-makes the race observable in the wild.
+The per-reader window between observing the in-progress state and subscribing
+is small — no `.await` sits inside it — so a *single* reader rarely straddles
+the publisher's one-shot `notify_waiters`. But the bug is **fan-out driven,
+not needle-threading**: `notify_waiters` fires exactly once and stores no
+permit, so *every* reader that observes the loading state and finishes
+subscribing after that single notify is lost forever. Under broad deletes —
+one small delete file referenced by many data files — a whole cohort of
+readers piles onto the same notifier, and many are still pre-subscribe when
+the fast load completes and notifies. This is why the
+`fuzz_parquet_file_rewriter` harness hits it constantly, and why throttling
+fuzz fan-out reduces CI hangs.
 
-### Deterministic local verification
+### Which site reproduces in isolation
 
-We also verified the fix with a temporary, local-only test hook in
-`DeleteFileIndex`. The hook was not kept in production code, even behind
-`cfg(test)`, because it adds scheduler-control plumbing solely for proving
-this race.
+The three sites are **not** equally easy to hit, which matters a lot when
+building a minimal reproducer:
 
-The hook forced this exact interleaving:
+- **`DeleteFileIndex::get_deletes_for_data_file` (during planning)** is the
+  *hardest*. `plan_files` never reads delete-file content — the delete stream
+  just turns manifest entries into `DeleteFileContext`s — so the `Populating`
+  phase is near-instant and readers almost never actually reach the wait. A
+  black-box stress harness (up to 20k rounds × 2048 readers, across both the
+  real `plan_files` scan and a synthetic driver, on a 100-worker-thread
+  runtime) did **not** reproduce it in ~20M reader calls.
+- **`CachingDeleteFileLoader` positional `WaitFor` path** is the *easiest*, and
+  is what the rewriter actually exercises. The first task to request a
+  positional-delete file wins `Load` and reads the (small) parquet; every
+  other task sharing the loader gets `WaitFor`. The waiters are serialized
+  through the write-locked `try_start_pos_del_load`, so while they trickle in,
+  the fast load finishes and `finish_pos_del_load` calls `notify_waiters` —
+  before many of them have subscribed.
 
-1. reader enters `get_deletes_for_data_file` and observes `Populating`
-2. reader parks before subscribing to `Notify`
-3. test drops the delete-file sender
-4. publisher transitions to `Populated` and calls `notify_waiters`
-5. test releases the reader
+### Kept reproduction
 
-With the fixed subscribe-before-recheck implementation, the reader returns
-immediately in step 5 because the re-check observes `Populated`. With the
-old implementation restored (`notifier.notified().await` directly after the
-first state read), the same test fails reliably by timeout:
+`arrow::caching_delete_file_loader::tests::broad_positional_delete_reproduces_lost_wakeup`
+drives the real `load_deletes` path with a broad positional delete: one tiny
+delete file, 2048 data-file tasks sharing one `CachingDeleteFileLoader`, on a
+100-worker-thread runtime, repeated for 200 rounds with a 10 s per-round
+timeout. The `load_deletes` API is identical on `main` and on the fix (only
+the internal wait was patched), so the same test source covers both:
 
-```text
-reader timed out after notify_waiters ran before subscription: Elapsed(())
-```
+- against the **pre-fix** `wait_for_pos_del_load`
+  (`notifier.notified().await` straight after observing `Loading`): a waiter
+  subscribes after the notify and parks forever; its `load_deletes` future
+  never resolves and the round times out. Verified **red at round 15 (~10 s)**.
+- against the **subscribe-before-recheck fix**: every waiter wakes; 200 rounds
+  pass in **~1.1 s**.
 
-This confirms that the current checked-in unit test is only smoke coverage,
-while the underlying race can be made deterministic by adding an explicit
-test-only scheduler gate at the observe/subscribe boundary.
+Oversubscribing worker threads (100 on far fewer cores) widens the
+read→subscribe gap via OS preemption, raising the hit rate.
 
 ### Manual stress verification
+
+> **Caveat (added later).** The numbers below come from an early throwaway
+> harness that "released 2048 readers at the wait path" — i.e. it poised the
+> readers at the subscribe point with explicit synchronisation before dropping
+> the sender. A *pure* black-box `DeleteFileIndex` stress loop (no such
+> poising) does **not** reproduce in isolation on a fast machine — see "Which
+> site reproduces in isolation" above. The reliable kept reproduction is the
+> positional-delete loader test, not this harness.
 
 A temporary local stress harness was also used to demonstrate the old bug
 without keeping extra regression-test code in the PR. The harness repeatedly
