@@ -30,6 +30,9 @@ has correctness and review-readiness issues that would likely block it.
 different `Notify`. A concurrent reader can observe the first notifier and wait
 forever, because completion only notifies the second notifier.
 
+DeleteFilter::try_start_eq_del_load and DeleteFilter::insert_equality_delete
+still use different Notify instances for the same equality-delete load.
+
 Relevant code:
 
 ```rust

@@ -524,7 +524,7 @@ mod tests {
         use std::time::Duration;
 
         for _ in 0..50 {
-            let (idx, tx) = DeleteFileIndex::new();
+            let (idx, tx) = DeleteFileIndex::new(Runtime::current());
             let data_file = build_unpartitioned_data_file();
 
             let mut handles = Vec::with_capacity(64);
